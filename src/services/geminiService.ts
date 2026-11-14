@@ -1,5 +1,27 @@
 import { GoogleGenAI, Content, Type } from "@google/genai";
 import { fetchSurahFromApi, fetchAyahFromApi, fetchHadithFromApi, fetchQuranAudioFromApi } from "./quranApiService";
+import {
+  getModelCapabilities,
+  resolveActualModelId,
+  resolveToolSelectionForModel,
+  foldSystemInstructionIntoContents,
+  isUnsupportedCapabilityError,
+  downgradeConfigForUnsupportedError,
+  isQuotaOrRateLimitError,
+  isRetryableModelFallbackError,
+  markModelRateLimited,
+  clearModelRateLimits,
+  orderModelsByAvailability,
+  formatUserFriendlyAiError,
+  hasWebSearchIntent,
+  buildToolBridgeProtocolPrompt,
+  parseBridgeToolCalls,
+  formatGroundingFromSearchResults,
+  extractSearchKeywords,
+  type ModelCapabilities,
+} from "../lib/modelCapabilities";
+
+export { getModelCapabilities, resolveActualModelId, type ModelCapabilities };
 
 export interface ApiKeyStatus {
   key: string;
@@ -27,9 +49,10 @@ export function setCustomApiKey(key: string): void {
   } catch (e) {
     console.error("Error saving custom API key:", e);
   }
-  // Invalidate cached client to force re-instantiation with new key
+  // Invalidate cached client and reset rate-limit cooldowns for new key
   aiClient = null;
   currentClientApiKey = null;
+  clearModelRateLimits();
 }
 
 export function getInternalEnvApiKey(): string {
@@ -68,23 +91,17 @@ export function getApiKeyStatus(): ApiKeyStatus {
   return { key: '', source: 'none', maskedKey: '' };
 }
 
-export function resolveActualModelId(modelId: string): string {
-  if (!modelId || typeof modelId !== 'string') return 'gemini-3.6-flash';
-  const clean = modelId.trim().replace(/^models\//, '');
-  if (clean === 'gemini-3.1-pro-preview-customtools') {
-    return 'gemini-3.1-pro-preview';
-  }
-  return clean;
-}
-
 export const FALLBACK_MODELS_CHAIN = [
-  'gemini-robotics-er-2-preview',
+  'gemini-3.6-flash',
+  'gemini-3.8-flash',
+  'gemini-4-hydrogen',
   'gemini-3.1-flash-lite',
-  'gemini-3-flash-preview'
+  'gemini-2.5-flash',
+  'gemma-4-26b-a4b-it'
 ];
 
 export function getModelSequence(primaryModel?: string): string[] {
-  const cleanPrimary = resolveActualModelId(primaryModel || 'gemini-3.6-flash');
+  const cleanPrimary = resolveActualModelId(primaryModel || 'gemini-2.5-flash');
   const sequence = [cleanPrimary];
   for (const fb of FALLBACK_MODELS_CHAIN) {
     const cleanFb = resolveActualModelId(fb);
@@ -92,7 +109,7 @@ export function getModelSequence(primaryModel?: string): string[] {
       sequence.push(cleanFb);
     }
   }
-  return sequence;
+  return orderModelsByAvailability(sequence);
 }
 
 let aiClient: GoogleGenAI | null = null;
@@ -120,7 +137,7 @@ export async function testApiKeyConnection(testKey?: string, preferredModel?: st
       return { success: false, message: "لم يتم العثور على أي مفتاح للاختبار. يرجى إدخال مفتاح API أولاً." };
     }
     const testClient = new GoogleGenAI({ apiKey: keyToTest });
-    const modelsToTry = getModelSequence(preferredModel || 'gemini-3.6-flash');
+    const modelsToTry = getModelSequence(preferredModel || 'gemini-2.5-flash');
     let lastErrorMsg = '';
 
     for (const modelId of modelsToTry) {
@@ -234,6 +251,7 @@ export interface AdvancedSettings {
   maxOutputTokens: number;
   enableGoogleSearch: boolean;
   enableEditorTools: boolean;
+  enableToolBridge: boolean;
   systemPromptOverride: string;
   executionTimeoutSeconds: number;
 }
@@ -245,6 +263,7 @@ export const DEFAULT_SETTINGS: AdvancedSettings = {
   maxOutputTokens: 65536,
   enableGoogleSearch: true,
   enableEditorTools: true,
+  enableToolBridge: true,
   systemPromptOverride: "",
   executionTimeoutSeconds: 45,
 };
@@ -329,7 +348,7 @@ export const AGENT_PRESETS = [
   }
 ];
 
-export async function generateSmartPersona(userHint: string, modelName: string = "gemini-3.6-flash"): Promise<string> {
+export async function generateSmartPersona(userHint: string, modelName: string = "gemini-2.5-flash"): Promise<string> {
   const ai = getClient();
   let prompt = "";
   if (userHint && userHint.trim()) {
@@ -349,13 +368,27 @@ export async function generateSmartPersona(userHint: string, modelName: string =
   }
 
   try {
-    const actualModel = resolveActualModelId(modelName);
-    const res = await ai.models.generateContent({
-      model: actualModel,
-      contents: prompt,
-      config: { temperature: 0.8 }
-    });
-    return res.text?.trim() || AGENT_PRESETS[0].systemPrompt;
+    const candidates = getModelSequence(modelName);
+    for (const candidateModel of candidates) {
+      try {
+        const caps = getModelCapabilities(candidateModel);
+        const res = await ai.models.generateContent({
+          model: candidateModel,
+          contents: prompt,
+          config: caps.supportsSamplingParams ? { temperature: 0.8 } : {}
+        });
+        const text = res.text?.trim();
+        if (text) return text;
+      } catch (err: any) {
+        if (isQuotaOrRateLimitError(err)) {
+          markModelRateLimited(candidateModel);
+        }
+        if (!isRetryableModelFallbackError(err)) {
+          throw err;
+        }
+      }
+    }
+    return AGENT_PRESETS[0].systemPrompt;
   } catch (err) {
     console.warn("Error generating smart persona:", err);
     if (userHint && userHint.trim()) {
@@ -366,177 +399,470 @@ export async function generateSmartPersona(userHint: string, modelName: string =
 }
 
 export const DEFAULT_ALL_MODELS: ModelOption[] = [
-  { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash (الأحدث والأسرع ✨)' },
-  { id: 'gemini-robotics-er-2-preview', name: 'Gemini Robotics ER-2 (خيار التراجع الأول 🤖)' },
-  { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite (خيار التراجع الثاني ⚡)' },
-  { id: 'gemini-3-flash-preview', name: 'Gemini 3.0 Flash (خيار التراجع الثالث 🌟)' },
-  { id: 'gemini-3.1-pro-preview-customtools', name: 'Gemini 3.1 Pro (أدوات مخصصة)' },
-  { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro (الأقوى - متطور)' },
-  { id: 'gemma-3-27b-it', name: 'Gemma 3 27B IT (نموذج جوما 3 المتقدم 🚀)' },
-  { id: 'gemma-3-12b-it', name: 'Gemma 3 12B IT (نموذج جوما 3)' },
-  { id: 'gemma-3-4b-it', name: 'Gemma 3 4B IT (نموذج جوما 3 خفيف)' },
-  { id: 'gemma-3-1b-it', name: 'Gemma 3 1B IT (نموذج جوما 3 فائق السرعة)' },
-  { id: 'gemma-2-27b-it', name: 'Gemma 2 27B IT' },
-  { id: 'gemma-2-9b-it', name: 'Gemma 2 9B IT' }
+  { id: 'gemini-2.5-flash', name: 'gemini-2.5-flash' },
+  { id: 'gemini-2.5-pro', name: 'gemini-2.5-pro' },
+  { id: 'gemma-4-26b-a4b-it', name: 'gemma-4-26b-a4b-it' },
+  { id: 'gemma-4-31b-it', name: 'gemma-4-31b-it' },
+  { id: 'gemini-2.5-flash-lite', name: 'gemini-2.5-flash-lite' },
+  { id: 'gemini-2.5-flash-image', name: 'gemini-2.5-flash-image' },
+  { id: 'gemini-3.1-flash-lite', name: 'gemini-3.1-flash-lite' },
+  { id: 'gemini-3-pro-image', name: 'gemini-3-pro-image' },
+  { id: 'gemini-3.1-flash-image', name: 'gemini-3.1-flash-image' },
+  { id: 'gemini-3.1-flash-lite-image', name: 'gemini-3.1-flash-lite-image' },
+  { id: 'gemini-nano-banana-2.1', name: 'gemini-nano-banana-2.1' },
+  { id: 'gemini-3.5-flash', name: 'gemini-3.5-flash' },
+  { id: 'gemini-3.5-flash-lite', name: 'gemini-3.5-flash-lite' },
+  { id: 'gemini-omni-flash-preview', name: 'gemini-omni-flash-preview' },
+  { id: 'gemini-3.6-flash', name: 'gemini-3.6-flash' },
+  { id: 'gemini-3.7-flash', name: 'gemini-3.7-flash' },
+  { id: 'gemini-3.8-flash', name: 'gemini-3.8-flash' },
+  { id: 'gemini-4-argon', name: 'gemini-4-argon' },
+  { id: 'gemini-4-carbon', name: 'gemini-4-carbon' },
+  { id: 'gemini-4-hydrogen', name: 'gemini-4-hydrogen' },
+  { id: 'antigravity-preview-05-2026', name: 'antigravity-preview-05-2026' },
+  { id: 'antigravity-preview-09-2026', name: 'antigravity-preview-09-2026' },
+  { id: 'antigravity-preview-latest', name: 'antigravity-preview-latest' },
+  { id: 'deep-research-max-preview-04-2026', name: 'deep-research-max-preview-04-2026' },
+  { id: 'deep-research-preview-04-2026', name: 'deep-research-preview-04-2026' },
+  { id: 'deep-research-pro-preview-12-2025', name: 'deep-research-pro-preview-12-2025' },
+  { id: 'gemini-embedding-001', name: 'gemini-embedding-001' },
+  { id: 'gemini-embedding-2', name: 'gemini-embedding-2' }
 ];
 
-export async function fetchAvailableModels(): Promise<ModelOption[]> {
+export async function fetchAvailableModels(forceRefresh = false): Promise<ModelOption[]> {
   const uniqueMap = new Map<string, ModelOption>();
 
-  // Add default Gemini & Gemma models first
-  DEFAULT_ALL_MODELS.forEach(m => uniqueMap.set(m.id, m));
-
-  try {
-    const ai = getClient();
-    const response = await ai.models.list();
-
-    const modelsList: any[] = [];
-    if (Array.isArray(response)) {
-      modelsList.push(...response);
-    } else if (response && typeof (response as any)[Symbol.asyncIterator] === 'function') {
-      for await (const m of (response as any)) {
-        modelsList.push(m);
-      }
-    } else if ((response as any)?.models && Array.isArray((response as any).models)) {
-      modelsList.push(...(response as any).models);
-    }
-
-    if (modelsList.length > 0) {
-      const validModels = modelsList.filter(m => {
-        const nameLower = (m.name || m.id || '').toLowerCase();
-        const isGeminiOrGemma = nameLower.includes('gemini') || nameLower.includes('gemma') || nameLower.includes('gema');
-        const supportsGenerate = m.supportedGenerationMethods ? m.supportedGenerationMethods.includes('generateContent') : true;
-        return isGeminiOrGemma && supportsGenerate;
-      });
-
-      for (const m of validModels) {
-        let cleanId = (m.name || m.id || '').replace(/^models\//, '');
-        if (!cleanId) continue;
-        
-        let displayName = m.displayName || cleanId;
-        if (cleanId.includes('gemma') || cleanId.includes('gema')) {
-          displayName = `Gemma (${cleanId})`;
-        } else if (cleanId.includes('3.6')) {
-          displayName += ' (أحدث إصدار ✨)';
-        } else if (cleanId.includes('3.1-pro')) {
-          displayName += ' (متطور جداً)';
-        } else if (cleanId.includes('flash')) {
-          displayName += ' (سريع)';
-        } else if (cleanId.includes('pro')) {
-          displayName += ' (احترافي)';
-        }
-
+  const collectFromList = (rawList: any[]) => {
+    for (const m of rawList) {
+      const rawName = (m?.name || m?.id || '').trim();
+      const cleanId = rawName.replace(/^models\//, '');
+      if (!cleanId) continue;
+      if (!uniqueMap.has(cleanId)) {
         uniqueMap.set(cleanId, {
           id: cleanId,
-          name: displayName
+          name: cleanId,
         });
       }
     }
+  };
+
+  try {
+    const status = getApiKeyStatus();
+    if (status.key) {
+      const ai = getClient();
+      const response = await ai.models.list({ config: { pageSize: 1000 } });
+
+      const modelsList: any[] = [];
+      if (Array.isArray(response)) {
+        modelsList.push(...response);
+      } else if (response && typeof (response as any)[Symbol.asyncIterator] === 'function') {
+        for await (const m of (response as any)) {
+          modelsList.push(m);
+        }
+      } else if ((response as any)?.models && Array.isArray((response as any).models)) {
+        modelsList.push(...(response as any).models);
+      }
+
+      if (modelsList.length > 0) {
+        collectFromList(modelsList);
+      }
+    }
   } catch (err) {
-    console.warn("Could not fetch models automatically, using comprehensive default list:", err);
+    console.warn("Client models.list fallback to server proxy:", err);
   }
 
-  // Ensure customtools is present for user workflow
-  if (!uniqueMap.has('gemini-3.1-pro-preview-customtools')) {
-    uniqueMap.set('gemini-3.1-pro-preview-customtools', { id: 'gemini-3.1-pro-preview-customtools', name: 'Gemini 3.1 Pro (أدوات مخصصة)' });
+  // Always check server endpoint if client list had no key or returned 0 models
+  if (uniqueMap.size === 0 && typeof fetch !== 'undefined') {
+    try {
+      const customKey = getCustomApiKey();
+      const headers: Record<string, string> = {};
+      if (customKey) headers['x-custom-api-key'] = customKey;
+      const res = await fetch(`/api/gemini/models${forceRefresh ? '?refresh=1' : ''}`, { headers });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data?.models) && data.models.length > 0) {
+          collectFromList(data.models);
+        }
+      }
+    } catch (serverErr) {
+      console.warn("Could not fetch models from server endpoint:", serverErr);
+    }
   }
 
-  return Array.from(uniqueMap.values());
+  if (uniqueMap.size > 0) {
+    return Array.from(uniqueMap.values());
+  }
+
+  return DEFAULT_ALL_MODELS;
+}
+
+function buildChatDeclarations(allowEditorMutation: boolean): any[] {
+  const declarations: any[] = [
+    {
+      name: "fetch_quran_audio",
+      description: "Fetches recitation audio streams, reciter info, and ayah audio URLs for any Surah or Ayah in the Quran with support for all major reciters (Alafasy, Abdul Basit, Minshawi, Husary, Sudais, Shuraym, Maher, Warsh, etc.).",
+      parameters: {
+        type: Type.OBJECT,
+        properties: {
+          surahIdentifier: { type: Type.STRING, description: "Surah number (1-114) or Surah name (e.g. '2', 'البقرة', 'يوسف', 'الكهف')" },
+          reciter: { type: Type.STRING, description: "Reciter ID e.g. ar.alafasy, ar.abdulbasitmurattal, ar.minshawi, ar.husary, ar.saoodshuraym, ar.sudais, ar.mahermuaiqly, ar.ghamadi" },
+          ayahNumber: { type: Type.NUMBER, description: "Optional Ayah number for specific verse audio" }
+        },
+        required: ["surahIdentifier"]
+      }
+    },
+    {
+      name: "fetch_quran_surah",
+      description: "Fetches complete text and metadata of a Quran Surah (1 to 114, or by Surah name e.g. 'الأعلى', 'سورة الكهف', '87') directly via API 100% complete without truncation.",
+      parameters: {
+        type: Type.OBJECT,
+        properties: {
+          surahIdentifier: { type: Type.STRING, description: "Surah number (1-114) or Surah name in Arabic/English (e.g. '87', 'الأعلى', '18', 'الكهف')" },
+          edition: { type: Type.STRING, description: "Edition/Riwayah identifier (e.g. ar.uthmani, ar.warsh, ar.alafasy)" }
+        },
+        required: ["surahIdentifier"]
+      }
+    },
+    {
+      name: "fetch_quran_ayah",
+      description: "Fetches specific Quran Ayah text directly via API to save tokens.",
+      parameters: { type: Type.OBJECT, properties: { surahNumber: { type: Type.NUMBER }, ayahNumber: { type: Type.NUMBER }, edition: { type: Type.STRING } }, required: ["surahNumber", "ayahNumber"] }
+    },
+    {
+      name: "fetch_hadith_data",
+      description: "Fetches Hadith text from books (bukhari, muslim, abudawud, tirmidhi, nasai, ibnmajah) directly via API.",
+      parameters: { type: Type.OBJECT, properties: { book: { type: Type.STRING, description: "Book identifier e.g. bukhari, muslim" }, number: { type: Type.NUMBER, description: "Hadith number" } }, required: ["book", "number"] }
+    },
+    {
+      name: "fetch_api_data",
+      description: "Fetches data (JSON/Text) from a web API or URL given the url. Use this BEFORE writing python code if you need web data, because the Python sandbox lacks internet access.",
+      parameters: { type: Type.OBJECT, properties: { url: { type: Type.STRING, description: "The complete URL to fetch" } }, required: ["url"] }
+    }
+  ];
+
+  if (allowEditorMutation) {
+    declarations.unshift(
+      {
+        name: "update_editor_code",
+        description: "Updates the python code inside the IDE editor. ONLY call this tool when the user explicitly requests writing, editing, fixing, or placing code into the editor. NEVER call this for greetings or general questions.",
+        parameters: { type: Type.OBJECT, properties: { code: { type: Type.STRING, description: "The complete new source code to place in the editor" } }, required: ["code"] }
+      },
+      {
+        name: "run_editor_code",
+        description: "Runs the current python code in the IDE and evaluates the results. ONLY call this when the user explicitly asks to execute or run code.",
+      }
+    );
+  }
+
+  return declarations;
+}
+
+async function performClientWebSearchBridge(query: string): Promise<{ results: { title: string; snippet: string; url: string }[]; groundingMetadata: any }> {
+  const cleanQuery = extractSearchKeywords(query);
+  if (!cleanQuery) return { results: [], groundingMetadata: null };
+
+  try {
+    if (typeof fetch !== 'undefined') {
+      const res = await fetch(`/api/web-search?q=${encodeURIComponent(cleanQuery)}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data?.results) && data.results.length > 0) {
+          return {
+            results: data.results,
+            groundingMetadata: data.groundingMetadata || formatGroundingFromSearchResults(data.results, cleanQuery),
+          };
+        }
+      }
+    }
+  } catch {}
+
+  try {
+    const hasArabic = /[\u0600-\u06FF]/.test(cleanQuery);
+    const wikiLang = hasArabic ? 'ar' : 'en';
+    const wikiRes = await fetch(`https://${wikiLang}.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(cleanQuery)}&utf8=1&format=json&origin=*&srlimit=4`);
+    if (wikiRes.ok) {
+      const wikiJson = await wikiRes.json();
+      const hits = wikiJson?.query?.search || [];
+      const results = hits.map((h: any) => ({
+        title: String(h.title || ''),
+        snippet: String(h.snippet || '').replace(/<[^>]+>/g, ''),
+        url: `https://${wikiLang}.wikipedia.org/wiki/${encodeURIComponent(String(h.title || '').replace(/\s+/g, '_'))}`,
+      })).filter((r: any) => r.title);
+      return {
+        results,
+        groundingMetadata: formatGroundingFromSearchResults(results, cleanQuery),
+      };
+    }
+  } catch {}
+
+  return { results: [], groundingMetadata: null };
+}
+
+function buildCapabilityAwareChatRequest(
+  actualModelName: string,
+  contents: Content[],
+  effectiveSystemInstruction: string,
+  settings: AdvancedSettings,
+  isGreetingTurn: boolean,
+  allowEditorMutation: boolean,
+  lastUserMessage: string
+) {
+  const declarations = buildChatDeclarations(allowEditorMutation);
+  const toolSelection = resolveToolSelectionForModel({
+    modelId: actualModelName,
+    enableEditorTools: settings.enableEditorTools,
+    enableGoogleSearch: settings.enableGoogleSearch,
+    isGreetingTurn,
+    allowEditorMutation,
+    lastUserMessage,
+    declarations,
+  });
+
+  const caps = toolSelection.capabilities;
+  const wantsTools = Boolean(settings.enableEditorTools) && !isGreetingTurn;
+  const wantsSearch = Boolean(settings.enableGoogleSearch) && !isGreetingTurn;
+  const bridgeEnabled = settings.enableToolBridge !== false;
+
+  const needsFunctionBridge = bridgeEnabled && wantsTools && !toolSelection.usedFunctionDeclarations;
+  const needsSearchBridge = bridgeEnabled && wantsSearch && !toolSelection.usedGoogleSearch;
+  const usingToolBridge = needsFunctionBridge || needsSearchBridge;
+
+  const modelSystemInstruction = usingToolBridge
+    ? `${effectiveSystemInstruction}\n\n${buildToolBridgeProtocolPrompt(allowEditorMutation, needsFunctionBridge, needsSearchBridge)}`
+    : effectiveSystemInstruction;
+
+  const config: any = {
+    maxOutputTokens: settings.maxOutputTokens ?? 65536,
+  };
+
+  if (caps.supportsSamplingParams) {
+    config.temperature = settings.temperature ?? 0.7;
+    config.topP = settings.topP ?? 0.95;
+    config.topK = settings.topK ?? 40;
+  }
+
+  let preparedContents: any[] = contents;
+  if (caps.supportsSystemInstruction) {
+    config.systemInstruction = modelSystemInstruction;
+  } else {
+    preparedContents = foldSystemInstructionIntoContents(contents, modelSystemInstruction);
+  }
+
+  if (toolSelection.tools.length > 0) {
+    config.tools = toolSelection.tools;
+  }
+  if (toolSelection.toolConfig) {
+    config.toolConfig = toolSelection.toolConfig;
+  }
+
+  return {
+    config,
+    preparedContents,
+    toolSelection,
+    modelSystemInstruction,
+    needsFunctionBridge,
+    needsSearchBridge,
+    usingToolBridge,
+  };
+}
+
+async function sendChatMessageForModel(
+  ai: GoogleGenAI,
+  actualModelName: string,
+  baseContents: Content[],
+  effectiveSystemInstruction: string,
+  settings: AdvancedSettings,
+  isGreetingTurn: boolean,
+  allowEditorMutation: boolean,
+  lastUserMessage: string
+): Promise<{ text: string; functionCalls?: any[]; groundingMetadata?: any }> {
+  let enrichedInstruction = effectiveSystemInstruction;
+  let bridgeGrounding: any = null;
+
+  const preCheckSelection = resolveToolSelectionForModel({
+    modelId: actualModelName,
+    enableEditorTools: settings.enableEditorTools,
+    enableGoogleSearch: settings.enableGoogleSearch,
+    isGreetingTurn,
+    allowEditorMutation,
+    lastUserMessage,
+    declarations: buildChatDeclarations(allowEditorMutation),
+  });
+
+  if (
+    settings.enableToolBridge !== false &&
+    settings.enableGoogleSearch &&
+    !isGreetingTurn &&
+    !preCheckSelection.usedGoogleSearch &&
+    hasWebSearchIntent(lastUserMessage)
+  ) {
+    const preSearch = await performClientWebSearchBridge(lastUserMessage);
+    if (preSearch.results.length > 0) {
+      bridgeGrounding = preSearch.groundingMetadata;
+      enrichedInstruction += `\n\n--- نتائج البحث المباشر من الويب ---\n${JSON.stringify(preSearch.results, null, 2)}\nاستخدم هذه المعلومات والمصادر الموثوقة في إجابتك.`;
+    }
+  }
+
+  const initial = buildCapabilityAwareChatRequest(
+    actualModelName,
+    baseContents,
+    enrichedInstruction,
+    settings,
+    isGreetingTurn,
+    allowEditorMutation,
+    lastUserMessage
+  );
+
+  let activeContents: any[] = initial.preparedContents;
+  let activeConfig: any = initial.config;
+
+  const invokeGenerate = async () => {
+    for (let attempt = 0; attempt <= 3; attempt++) {
+      try {
+        return await ai.models.generateContent({
+          model: actualModelName,
+          contents: activeContents,
+          config: activeConfig
+        });
+      } catch (err: any) {
+        if (!isUnsupportedCapabilityError(err)) {
+          throw err;
+        }
+        const downgraded = downgradeConfigForUnsupportedError(
+          activeContents,
+          activeConfig,
+          initial.modelSystemInstruction,
+          attempt
+        );
+        if (!downgraded) throw err;
+        console.warn(`Adjusting request config for model ${actualModelName} compatibility (step ${attempt + 1}).`);
+        activeContents = downgraded.contents;
+        activeConfig = downgraded.config;
+      }
+    }
+    throw new Error("فشل الاتصال بالنموذج بعد محاولات التوافق التلقائي.");
+  };
+
+  let response = await invokeGenerate();
+
+  let text = "";
+  try { text = response.text || ""; } catch(e) {}
+
+  let groundingMetadata = response.candidates?.[0]?.groundingMetadata || bridgeGrounding;
+  let extraFunctionCalls: any[] = [];
+
+  if (initial.usingToolBridge && text) {
+    const parsedBridge = parseBridgeToolCalls(text);
+    text = parsedBridge.cleanedText;
+
+    if (parsedBridge.toolCalls.length > 0) {
+      const bridgeDataOutputs: string[] = [];
+      for (const bCall of parsedBridge.toolCalls) {
+        if (bCall.name === 'update_editor_code' || bCall.name === 'run_editor_code') {
+          if (allowEditorMutation) {
+            extraFunctionCalls.push({ name: bCall.name, args: bCall.args });
+          }
+        } else if (bCall.name === 'web_search') {
+          const searchRes = await performClientWebSearchBridge(String(bCall.args?.query || lastUserMessage));
+          if (searchRes.groundingMetadata) groundingMetadata = searchRes.groundingMetadata;
+          bridgeDataOutputs.push(`نتائج web_search:\n${JSON.stringify(searchRes.results)}`);
+        } else {
+          const toolOut = await executeServerSideToolCall(bCall);
+          bridgeDataOutputs.push(`نتيجة ${bCall.name}:\n${toolOut}`);
+        }
+      }
+
+      if (bridgeDataOutputs.length > 0) {
+        activeContents = [
+          ...activeContents,
+          { role: 'model', parts: [{ text: parsedBridge.cleanedText || 'جاري جلب البيانات عبر الأداة...' }] },
+          { role: 'user', parts: [{ text: `إليك البيانات الحقيقية المجلوبة من الأدوات:\n\n${bridgeDataOutputs.join('\n\n')}\n\nقدّم الإجابة النهائية الدقيقة والمفيدة للمستخدم الآن دون إخراج وسوم TOOL_CALL.` }] }
+        ];
+        response = await invokeGenerate();
+        try { text = response.text || ""; } catch(e) {}
+        const secondParse = parseBridgeToolCalls(text);
+        text = secondParse.cleanedText;
+        for (const bCall of secondParse.toolCalls) {
+          if ((bCall.name === 'update_editor_code' || bCall.name === 'run_editor_code') && allowEditorMutation) {
+            extraFunctionCalls.push({ name: bCall.name, args: bCall.args });
+          }
+        }
+      }
+    }
+  }
+
+  const fetchTools = ["fetch_quran_surah", "fetch_quran_ayah", "fetch_hadith_data", "fetch_api_data", "fetch_quran_audio"];
+  let loopCount = 0;
+
+  while (loopCount < 3) {
+    const functionCalls = response.functionCalls;
+    if (!functionCalls || !functionCalls.some(c => fetchTools.includes(c.name || ''))) {
+      break;
+    }
+
+    const toolCall = functionCalls.find(c => fetchTools.includes(c.name || ''))!;
+    const fetchedContent = await executeServerSideToolCall(toolCall);
+
+    const modelContent = response.candidates?.[0]?.content;
+    if (modelContent) {
+      activeContents.push(modelContent);
+    } else {
+      activeContents.push({
+        role: 'model',
+        parts: [{ functionCall: toolCall as any }]
+      });
+    }
+
+    activeContents.push({
+      role: 'user',
+      parts: [{
+        functionResponse: {
+          ...(toolCall.id ? { id: toolCall.id } : {}),
+          name: toolCall.name,
+          response: { result: fetchedContent }
+        }
+      }]
+    } as any);
+
+    response = await invokeGenerate();
+
+    try { text = response.text || ""; } catch(e) {}
+    if (response.candidates?.[0]?.groundingMetadata) {
+      groundingMetadata = response.candidates[0].groundingMetadata;
+    }
+    loopCount++;
+  }
+
+  const mergedCalls = [...(response.functionCalls || []), ...extraFunctionCalls];
+  return {
+    text,
+    functionCalls: mergedCalls.length > 0 ? mergedCalls : undefined,
+    groundingMetadata
+  };
 }
 
 export async function sendChatMessage(
   messages: {role: string, content: string}[],
   systemInstruction: string,
-  modelName: string = "gemini-3.6-flash",
+  modelName: string = "gemini-2.5-flash",
   currentImagesBase64: string[] = [],
   settings: AdvancedSettings = DEFAULT_SETTINGS
 ): Promise<{text: string, functionCalls?: any[], groundingMetadata?: any}> {
   const ai = getClient();
-  const actualModelName = resolveActualModelId(modelName);
-  const isGemma = actualModelName.includes('gemma');
 
   const lastUserMessage = [...messages].reverse().find(m => m.role === 'user')?.content || '';
   const isGreetingTurn = isPureGreetingOrSocial(lastUserMessage);
   const allowEditorMutation = !isGreetingTurn && hasCodeOrEditorIntent(lastUserMessage, currentImagesBase64.length > 0);
 
-  const toolsConfig: any[] = [];
-  
-  if (settings.enableEditorTools && !isGemma && !isGreetingTurn) {
-    const declarations: any[] = [
-      {
-        name: "fetch_quran_audio",
-        description: "Fetches recitation audio streams, reciter info, and ayah audio URLs for any Surah or Ayah in the Quran with support for all major reciters (Alafasy, Abdul Basit, Minshawi, Husary, Sudais, Shuraym, Maher, Warsh, etc.).",
-        parameters: {
-          type: Type.OBJECT,
-          properties: {
-            surahIdentifier: { type: Type.STRING, description: "Surah number (1-114) or Surah name (e.g. '2', 'البقرة', 'يوسف', 'الكهف')" },
-            reciter: { type: Type.STRING, description: "Reciter ID e.g. ar.alafasy, ar.abdulbasitmurattal, ar.minshawi, ar.husary, ar.saoodshuraym, ar.sudais, ar.mahermuaiqly, ar.ghamadi" },
-            ayahNumber: { type: Type.NUMBER, description: "Optional Ayah number for specific verse audio" }
-          },
-          required: ["surahIdentifier"]
-        }
-      },
-      {
-        name: "fetch_quran_surah",
-        description: "Fetches complete text and metadata of a Quran Surah (1 to 114, or by Surah name e.g. 'الأعلى', 'سورة الكهف', '87') directly via API 100% complete without truncation.",
-        parameters: { 
-          type: Type.OBJECT, 
-          properties: { 
-            surahIdentifier: { type: Type.STRING, description: "Surah number (1-114) or Surah name in Arabic/English (e.g. '87', 'الأعلى', '18', 'الكهف')" }, 
-            edition: { type: Type.STRING, description: "Edition/Riwayah identifier (e.g. ar.uthmani, ar.warsh, ar.alafasy)" } 
-          }, 
-          required: ["surahIdentifier"] 
-        }
-      },
-      {
-        name: "fetch_quran_ayah",
-        description: "Fetches specific Quran Ayah text directly via API to save tokens.",
-        parameters: { type: Type.OBJECT, properties: { surahNumber: { type: Type.NUMBER }, ayahNumber: { type: Type.NUMBER }, edition: { type: Type.STRING } }, required: ["surahNumber", "ayahNumber"] }
-      },
-      {
-        name: "fetch_hadith_data",
-        description: "Fetches Hadith text from books (bukhari, muslim, abudawud, tirmidhi, nasai, ibnmajah) directly via API.",
-        parameters: { type: Type.OBJECT, properties: { book: { type: Type.STRING, description: "Book identifier e.g. bukhari, muslim" }, number: { type: Type.NUMBER, description: "Hadith number" } }, required: ["book", "number"] }
-      },
-      {
-        name: "fetch_api_data",
-        description: "Fetches data (JSON/Text) from a web API or URL given the url. Use this BEFORE writing python code if you need web data, because the Python sandbox lacks internet access.",
-        parameters: { type: Type.OBJECT, properties: { url: { type: Type.STRING, description: "The complete URL to fetch" } }, required: ["url"] }
-      }
-    ];
-
-    if (allowEditorMutation) {
-      declarations.unshift(
-        {
-          name: "update_editor_code",
-          description: "Updates the python code inside the IDE editor. ONLY call this tool when the user explicitly requests writing, editing, fixing, or placing code into the editor. NEVER call this for greetings or general questions.",
-          parameters: { type: Type.OBJECT, properties: { code: { type: Type.STRING, description: "The complete new source code to place in the editor" } }, required: ["code"] }
-        },
-        {
-          name: "run_editor_code",
-          description: "Runs the current python code in the IDE and evaluates the results. ONLY call this when the user explicitly asks to execute or run code.",
-        }
-      );
-    }
-
-    toolsConfig.push({
-      functionDeclarations: declarations
-    });
-  }
-
-  if (settings.enableGoogleSearch && !isGreetingTurn) {
-    toolsConfig.push({ googleSearch: {} });
-  }
-
   const effectiveSystemInstruction = settings.systemPromptOverride && settings.systemPromptOverride.trim()
     ? `${settings.systemPromptOverride.trim()}\n\n--- التعليمات والسياق التقني التشغيلي ---\n${systemInstruction}`
     : systemInstruction;
 
-  const contents: Content[] = messages
+  const baseContents: Content[] = messages
     .filter(msg => msg.content && msg.content.trim().length > 0)
     .map((msg, index, arr) => {
       const parts: any[] = [{ text: msg.content }];
-      
+
       // Attach current plot images to the very last user message for context
       if (index === arr.length - 1 && msg.role === 'user' && currentImagesBase64.length > 0) {
          currentImagesBase64.forEach(img => {
@@ -556,180 +882,306 @@ export async function sendChatMessage(
       };
     });
 
-  try {
-    const config: any = {
-      systemInstruction: effectiveSystemInstruction,
-      temperature: settings.temperature ?? 0.7,
-      topP: settings.topP ?? 0.95,
-      topK: settings.topK ?? 40,
-      maxOutputTokens: settings.maxOutputTokens ?? 65536,
-    };
+  const candidateModels = getModelSequence(modelName);
+  let lastErr: any = null;
 
-    if (toolsConfig.length > 0) {
-      config.tools = toolsConfig;
-      config.toolConfig = { includeServerSideToolInvocations: true };
+  for (const candidateModel of candidateModels) {
+    try {
+      return await sendChatMessageForModel(
+        ai,
+        candidateModel,
+        baseContents,
+        effectiveSystemInstruction,
+        settings,
+        isGreetingTurn,
+        allowEditorMutation,
+        lastUserMessage
+      );
+    } catch (err: any) {
+      lastErr = err;
+      if (isQuotaOrRateLimitError(err)) {
+        markModelRateLimited(candidateModel);
+      }
+      if (isRetryableModelFallbackError(err)) {
+        console.warn(`Model ${candidateModel} unavailable or rate-limited (429/404), trying next fallback model...`);
+        continue;
+      }
+      throw new Error(formatUserFriendlyAiError(err));
+    }
+  }
+
+  console.warn("All fallback models failed:", formatUserFriendlyAiError(lastErr));
+  throw new Error(formatUserFriendlyAiError(lastErr));
+}
+
+async function sendChatMessageStreamForModel(
+  ai: GoogleGenAI,
+  actualModelName: string,
+  baseContents: Content[],
+  effectiveSystemInstruction: string,
+  settings: AdvancedSettings,
+  isGreetingTurn: boolean,
+  allowEditorMutation: boolean,
+  lastUserMessage: string,
+  onChunk?: (text: string) => void
+): Promise<{ text: string; functionCalls?: any[]; groundingMetadata?: any; emittedAny: boolean }> {
+  let enrichedInstruction = effectiveSystemInstruction;
+  let bridgeGrounding: any = null;
+
+  const preCheckSelection = resolveToolSelectionForModel({
+    modelId: actualModelName,
+    enableEditorTools: settings.enableEditorTools,
+    enableGoogleSearch: settings.enableGoogleSearch,
+    isGreetingTurn,
+    allowEditorMutation,
+    lastUserMessage,
+    declarations: buildChatDeclarations(allowEditorMutation),
+  });
+
+  if (
+    settings.enableToolBridge !== false &&
+    settings.enableGoogleSearch &&
+    !isGreetingTurn &&
+    !preCheckSelection.usedGoogleSearch &&
+    hasWebSearchIntent(lastUserMessage)
+  ) {
+    const preSearch = await performClientWebSearchBridge(lastUserMessage);
+    if (preSearch.results.length > 0) {
+      bridgeGrounding = preSearch.groundingMetadata;
+      enrichedInstruction += `\n\n--- نتائج البحث المباشر من الويب ---\n${JSON.stringify(preSearch.results, null, 2)}\nاستخدم هذه المعلومات والمصادر الموثوقة في إجابتك.`;
+    }
+  }
+
+  const initial = buildCapabilityAwareChatRequest(
+    actualModelName,
+    baseContents,
+    enrichedInstruction,
+    settings,
+    isGreetingTurn,
+    allowEditorMutation,
+    lastUserMessage
+  );
+
+  let activeContents: any[] = initial.preparedContents;
+  let activeConfig: any = initial.config;
+
+  let accumulatedText = "";
+  let functionCalls: any[] = [];
+  let groundingMetadata: any = bridgeGrounding;
+  let streamParts: any[] = [];
+  let isMaxTokens = false;
+  let emittedAny = false;
+
+  const runStream = async (currentContents: any[], emitChunk = true) => {
+    for (let attempt = 0; attempt <= 3; attempt++) {
+      let emittedInAttempt = false;
+      try {
+        isMaxTokens = false;
+        const responseStream = await ai.models.generateContentStream({
+          model: actualModelName,
+          contents: currentContents,
+          config: activeConfig
+        });
+
+        for await (const chunk of responseStream) {
+          if (chunk.candidates?.[0]?.groundingMetadata) {
+            groundingMetadata = chunk.candidates[0].groundingMetadata;
+          }
+          if (chunk.candidates?.[0]?.content?.parts) {
+            streamParts.push(...chunk.candidates[0].content.parts);
+          }
+          if (chunk.text) {
+            emittedInAttempt = true;
+            accumulatedText += chunk.text;
+            if (emitChunk && onChunk) {
+              const visible = accumulatedText.replace(/<<<TOOL_CALL:[\s\S]*?(?:>>>|$)/g, '').trim();
+              if (visible) {
+                emittedAny = true;
+                onChunk(visible);
+              }
+            }
+          }
+          if (chunk.functionCalls && chunk.functionCalls.length > 0) {
+            emittedInAttempt = true;
+            emittedAny = true;
+            functionCalls.push(...chunk.functionCalls);
+          }
+
+          const finishReason = chunk.candidates?.[0]?.finishReason;
+          if (finishReason === 'MAX_TOKENS') {
+            isMaxTokens = true;
+          }
+        }
+        return;
+      } catch (err: any) {
+        if (emittedInAttempt || !isUnsupportedCapabilityError(err)) {
+          throw err;
+        }
+        const downgraded = downgradeConfigForUnsupportedError(
+          currentContents,
+          activeConfig,
+          initial.modelSystemInstruction,
+          attempt
+        );
+        if (!downgraded) throw err;
+        console.warn(`Adjusting stream config for model ${actualModelName} compatibility (step ${attempt + 1}).`);
+        currentContents = downgraded.contents;
+        activeContents = downgraded.contents;
+        activeConfig = downgraded.config;
+        streamParts = [];
+      }
+    }
+  };
+
+  try {
+    await runStream(activeContents, !initial.usingToolBridge);
+
+    // Auto-continue if MAX_TOKENS reached (up to 5 times for very long text)
+    let continuationCount = 0;
+    while (isMaxTokens && functionCalls.length === 0 && continuationCount < 5) {
+      continuationCount++;
+      activeContents.push({
+        role: 'model',
+        parts: streamParts
+      });
+      activeContents.push({
+        role: 'user',
+        parts: [{ text: "أكمل من حيث توقفت تماماً وبدون أي مقدمات أو اعتذار لتكتمل السورة أو النص." }]
+      });
+      streamParts = [];
+      await runStream(activeContents, !initial.usingToolBridge);
     }
 
-    let response = await ai.models.generateContent({
-      model: actualModelName,
-      contents,
-      config
-    });
+    if (initial.usingToolBridge) {
+      const parsedBridge = parseBridgeToolCalls(accumulatedText);
+      accumulatedText = parsedBridge.cleanedText;
+      let streamedSecondRound = false;
 
-    let text = "";
-    try { text = response.text || ""; } catch(e) {}
+      if (parsedBridge.toolCalls.length > 0) {
+        const bridgeDataOutputs: string[] = [];
+        for (const bCall of parsedBridge.toolCalls) {
+          if (bCall.name === 'update_editor_code' || bCall.name === 'run_editor_code') {
+            if (allowEditorMutation) {
+              functionCalls.push({ name: bCall.name, args: bCall.args });
+            }
+          } else if (bCall.name === 'web_search') {
+            const searchRes = await performClientWebSearchBridge(String(bCall.args?.query || lastUserMessage));
+            if (searchRes.groundingMetadata) groundingMetadata = searchRes.groundingMetadata;
+            bridgeDataOutputs.push(`نتائج web_search:\n${JSON.stringify(searchRes.results)}`);
+          } else {
+            const toolOut = await executeServerSideToolCall(bCall);
+            bridgeDataOutputs.push(`نتيجة ${bCall.name}:\n${toolOut}`);
+          }
+        }
 
-    let groundingMetadata = response.candidates?.[0]?.groundingMetadata;
-
-    // Handle server-side data fetching tools internally
-    const fetchTools = ["fetch_quran_surah", "fetch_quran_ayah", "fetch_hadith_data", "fetch_api_data"];
-    let loopCount = 0;
-
-    while (loopCount < 3) {
-      let functionCalls = response.functionCalls;
-      if (!functionCalls || !functionCalls.some(c => fetchTools.includes(c.name || ''))) {
-        break;
+        if (bridgeDataOutputs.length > 0) {
+          activeContents = [
+            ...activeContents,
+            { role: 'model', parts: [{ text: parsedBridge.cleanedText || 'جاري جلب البيانات عبر الأداة...' }] },
+            { role: 'user', parts: [{ text: `إليك البيانات الحقيقية المجلوبة من الأدوات:\n\n${bridgeDataOutputs.join('\n\n')}\n\nقدّم الإجابة النهائية الدقيقة والمفيدة للمستخدم الآن دون إخراج وسوم TOOL_CALL.` }] }
+          ];
+          accumulatedText = '';
+          streamParts = [];
+          streamedSecondRound = true;
+          await runStream(activeContents, true);
+          const secondParse = parseBridgeToolCalls(accumulatedText);
+          accumulatedText = secondParse.cleanedText;
+          for (const bCall of secondParse.toolCalls) {
+            if ((bCall.name === 'update_editor_code' || bCall.name === 'run_editor_code') && allowEditorMutation) {
+              functionCalls.push({ name: bCall.name, args: bCall.args });
+            }
+          }
+        }
       }
 
-      const toolCall = functionCalls.find(c => fetchTools.includes(c.name || ''))!;
+      if (accumulatedText && !streamedSecondRound && onChunk) {
+        emittedAny = true;
+        onChunk(accumulatedText);
+      }
+    }
+
+    const fetchTools = ["fetch_quran_surah", "fetch_quran_ayah", "fetch_hadith_data", "fetch_api_data", "fetch_quran_audio"];
+    if (functionCalls.length > 0 && functionCalls.some(c => fetchTools.includes(c.name))) {
+      const toolCall = functionCalls.find(c => fetchTools.includes(c.name))!;
       const fetchedContent = await executeServerSideToolCall(toolCall);
 
-      const modelContent = response.candidates?.[0]?.content;
-      if (modelContent) {
-        contents.push(modelContent);
+      if (streamParts.length > 0) {
+        activeContents.push({
+          role: 'model',
+          parts: streamParts
+        });
       } else {
-        contents.push({
+        activeContents.push({
           role: 'model',
           parts: [{ functionCall: toolCall as any }]
         });
       }
 
-      contents.push({
+      activeContents.push({
         role: 'user',
         parts: [{
           functionResponse: {
+            ...(toolCall.id ? { id: toolCall.id } : {}),
             name: toolCall.name,
             response: { result: fetchedContent }
           }
         }]
       } as any);
 
-      response = await ai.models.generateContent({
+      const secondStream = await ai.models.generateContentStream({
         model: actualModelName,
-        contents,
-        config
+        contents: activeContents,
+        config: activeConfig
       });
 
-      try { text = response.text || ""; } catch(e) {}
-      if (response.candidates?.[0]?.groundingMetadata) {
-        groundingMetadata = response.candidates[0].groundingMetadata;
+      for await (const chunk of secondStream) {
+        if (chunk.candidates?.[0]?.groundingMetadata) {
+          groundingMetadata = chunk.candidates[0].groundingMetadata;
+        }
+        if (chunk.text) {
+          emittedAny = true;
+          accumulatedText += chunk.text;
+          if (onChunk) {
+            onChunk(accumulatedText);
+          }
+        }
+        if (chunk.functionCalls) {
+          emittedAny = true;
+          functionCalls.push(...chunk.functionCalls);
+        }
       }
-      loopCount++;
     }
 
-    return { text, functionCalls: response.functionCalls, groundingMetadata };
+    if (!accumulatedText.trim() && functionCalls.length === 0) {
+      throw new Error('503 service unavailable: empty model response');
+    }
+
+    return { text: accumulatedText, functionCalls, groundingMetadata, emittedAny };
   } catch (err: any) {
-    console.error("Chat message error:", err);
-    let errMsg = typeof err === 'string' ? err : (err.message || JSON.stringify(err));
-    if (errMsg.includes("429") || errMsg.includes("quota") || errMsg.includes("RESOURCE_EXHAUSTED")) {
-      throw new Error("لقد استنفدت الحصة المخصصة (Quota) لمفتاح API الخاص بك (خطأ 429). الرجاء المحاولة بعد قليل أو الترقية لنموذج أخف مثل Flash.");
-    }
-    if (errMsg.includes("thought signature") || errMsg.includes("Function call")) {
-      throw new Error("حدث تعارض في توقيع أداة الذكاء الاصطناعي. يمكنك جلب النصوص القرآنية والحديثية مباشرة عبر زر الجلب الذكي السريع بجانب إرفاق الملفات.");
-    }
-    throw new Error(err.message || "فشل الاتصال بالذكاء الاصطناعي بسبب خطأ في الخادم أو أن الطلب طويل جداً.");
+    (err as any).__emittedAny = emittedAny;
+    throw err;
   }
 }
 
 export async function sendChatMessageStream(
   messages: {role: string, content: string}[],
   systemInstruction: string,
-  modelName: string = "gemini-3.6-flash",
+  modelName: string = "gemini-2.5-flash",
   currentImagesBase64: string[] = [],
   settings: AdvancedSettings = DEFAULT_SETTINGS,
   onChunk?: (text: string) => void
 ): Promise<{text: string, functionCalls?: any[], groundingMetadata?: any}> {
   const ai = getClient();
-  const actualModelName = resolveActualModelId(modelName);
-  const isGemma = actualModelName.includes('gemma');
 
   const lastUserMessage = [...messages].reverse().find(m => m.role === 'user')?.content || '';
   const isGreetingTurn = isPureGreetingOrSocial(lastUserMessage);
   const allowEditorMutation = !isGreetingTurn && hasCodeOrEditorIntent(lastUserMessage, currentImagesBase64.length > 0);
 
-  const toolsConfig: any[] = [];
-  if (settings.enableEditorTools && !isGemma && !isGreetingTurn) {
-    const declarations: any[] = [
-      {
-        name: "fetch_quran_audio",
-        description: "Fetches recitation audio streams, reciter info, and ayah audio URLs for any Surah or Ayah in the Quran with support for all major reciters.",
-        parameters: {
-          type: Type.OBJECT,
-          properties: {
-            surahIdentifier: { type: Type.STRING, description: "Surah number (1-114) or Surah name" },
-            reciter: { type: Type.STRING, description: "Reciter ID" },
-            ayahNumber: { type: Type.NUMBER, description: "Optional Ayah number" }
-          },
-          required: ["surahIdentifier"]
-        }
-      },
-      {
-        name: "fetch_quran_surah",
-        description: "Fetches complete text and metadata of a Quran Surah (1 to 114, or by Surah name e.g. 'الأعلى', 'سورة الكهف', '87') directly via API 100% complete without truncation.",
-        parameters: { 
-          type: Type.OBJECT, 
-          properties: { 
-            surahIdentifier: { type: Type.STRING, description: "Surah number (1-114) or Surah name in Arabic/English (e.g. '87', 'الأعلى', '18', 'الكهف')" }, 
-            edition: { type: Type.STRING, description: "Edition/Riwayah identifier (e.g. ar.uthmani, ar.warsh, ar.alafasy)" } 
-          }, 
-          required: ["surahIdentifier"] 
-        }
-      },
-      {
-        name: "fetch_quran_ayah",
-        description: "Fetches specific Quran Ayah text directly via API to save tokens.",
-        parameters: { type: Type.OBJECT, properties: { surahNumber: { type: Type.NUMBER }, ayahNumber: { type: Type.NUMBER }, edition: { type: Type.STRING } }, required: ["surahNumber", "ayahNumber"] }
-      },
-      {
-        name: "fetch_hadith_data",
-        description: "Fetches Hadith text from books (bukhari, muslim, abudawud, tirmidhi, nasai, ibnmajah) directly via API.",
-        parameters: { type: Type.OBJECT, properties: { book: { type: Type.STRING, description: "Book identifier e.g. bukhari, muslim" }, number: { type: Type.NUMBER, description: "Hadith number" } }, required: ["book", "number"] }
-      },
-      {
-        name: "fetch_api_data",
-        description: "Fetches data (JSON/Text) from a web API or URL given the url. Use this BEFORE writing python code if you need web data, because the Python sandbox lacks internet access.",
-        parameters: { type: Type.OBJECT, properties: { url: { type: Type.STRING, description: "The complete URL to fetch" } }, required: ["url"] }
-      }
-    ];
-
-    if (allowEditorMutation) {
-      declarations.unshift(
-        {
-          name: "update_editor_code",
-          description: "Updates the python code inside the IDE editor. ONLY call this tool when the user explicitly requests writing, editing, fixing, or placing code into the editor. NEVER call this for greetings or general questions.",
-          parameters: { type: Type.OBJECT, properties: { code: { type: Type.STRING, description: "The complete new source code to place in the editor" } }, required: ["code"] }
-        },
-        {
-          name: "run_editor_code",
-          description: "Runs the current python code in the IDE and evaluates the results. ONLY call this when the user explicitly asks to execute or run code.",
-        }
-      );
-    }
-
-    toolsConfig.push({
-      functionDeclarations: declarations
-    });
-  }
-
-  if (settings.enableGoogleSearch && !isGreetingTurn) {
-    toolsConfig.push({ googleSearch: {} });
-  }
-
   const effectiveSystemInstruction = settings.systemPromptOverride && settings.systemPromptOverride.trim()
     ? `${settings.systemPromptOverride.trim()}\n\n--- التعليمات والسياق التقني التشغيلي ---\n${systemInstruction}`
     : systemInstruction;
 
-  const contents: Content[] = messages
+  const baseContents: Content[] = messages
     .filter(msg => msg.content && msg.content.trim().length > 0)
     .map((msg, index, arr) => {
       const parts: any[] = [{ text: msg.content }];
@@ -751,197 +1203,142 @@ export async function sendChatMessageStream(
       };
     });
 
-  const config: any = {
-    systemInstruction: effectiveSystemInstruction,
-    temperature: settings.temperature ?? 0.7,
-    topP: settings.topP ?? 0.95,
-    topK: settings.topK ?? 40,
-    maxOutputTokens: settings.maxOutputTokens ?? 65536,
-  };
+  const candidateModels = getModelSequence(modelName);
+  let lastErr: any = null;
 
-  if (toolsConfig.length > 0) {
-    config.tools = toolsConfig;
-    config.toolConfig = { includeServerSideToolInvocations: true };
+  for (const candidateModel of candidateModels) {
+    try {
+      const res = await sendChatMessageStreamForModel(
+        ai,
+        candidateModel,
+        baseContents,
+        effectiveSystemInstruction,
+        settings,
+        isGreetingTurn,
+        allowEditorMutation,
+        lastUserMessage,
+        onChunk
+      );
+      return {
+        text: res.text,
+        functionCalls: res.functionCalls,
+        groundingMetadata: res.groundingMetadata,
+      };
+    } catch (err: any) {
+      lastErr = err;
+      const emittedAny = Boolean(err?.__emittedAny);
+      if (isQuotaOrRateLimitError(err)) {
+        markModelRateLimited(candidateModel);
+      }
+      if (!emittedAny && isRetryableModelFallbackError(err)) {
+        console.warn(`Stream model ${candidateModel} unavailable or rate-limited (429/404), trying next fallback model...`);
+        continue;
+      }
+      // For non-retryable stream errors (e.g. transport hiccup) try direct non-stream fallback once on unthrottled models
+      if (!isQuotaOrRateLimitError(err)) {
+        try {
+          return await sendChatMessage(messages, systemInstruction, candidateModel, currentImagesBase64, settings);
+        } catch (directErr: any) {
+          lastErr = directErr;
+          if (!isRetryableModelFallbackError(directErr)) {
+            throw directErr;
+          }
+          continue;
+        }
+      }
+      throw new Error(formatUserFriendlyAiError(err));
+    }
   }
 
-  try {
-    let accumulatedText = "";
-    let functionCalls: any[] = [];
-    let groundingMetadata: any = null;
-    let streamParts: any[] = [];
-    let isMaxTokens = false;
-
-    const runStream = async (currentContents: any[]) => {
-      isMaxTokens = false;
-      const responseStream = await ai.models.generateContentStream({
-        model: actualModelName,
-        contents: currentContents,
-        config
-      });
-
-      for await (const chunk of responseStream) {
-        if (chunk.candidates?.[0]?.groundingMetadata) {
-          groundingMetadata = chunk.candidates[0].groundingMetadata;
-        }
-        if (chunk.candidates?.[0]?.content?.parts) {
-          streamParts.push(...chunk.candidates[0].content.parts);
-        }
-        if (chunk.text) {
-          accumulatedText += chunk.text;
-          if (onChunk) {
-            onChunk(accumulatedText);
-          }
-        }
-        if (chunk.functionCalls && chunk.functionCalls.length > 0) {
-          functionCalls.push(...chunk.functionCalls);
-        }
-        
-        const finishReason = chunk.candidates?.[0]?.finishReason;
-        if (finishReason === 'MAX_TOKENS') {
-          isMaxTokens = true;
-        }
-      }
-    };
-
-    await runStream(contents);
-    
-    // Auto-continue if MAX_TOKENS reached (up to 5 times for very long text)
-    let continuationCount = 0;
-    while (isMaxTokens && functionCalls.length === 0 && continuationCount < 5) {
-      continuationCount++;
-      contents.push({
-        role: 'model',
-        parts: streamParts
-      });
-      contents.push({
-        role: 'user',
-        parts: [{ text: "أكمل من حيث توقفت تماماً وبدون أي مقدمات أو اعتذار لتكتمل السورة أو النص." }]
-      });
-      streamParts = []; // Reset for the next stream
-      await runStream(contents);
-    }
-
-    const fetchTools = ["fetch_quran_surah", "fetch_quran_ayah", "fetch_hadith_data", "fetch_api_data", "fetch_quran_audio"];
-    if (functionCalls.length > 0 && functionCalls.some(c => fetchTools.includes(c.name))) {
-      const toolCall = functionCalls.find(c => fetchTools.includes(c.name))!;
-      const fetchedContent = await executeServerSideToolCall(toolCall);
-
-      if (streamParts.length > 0) {
-        contents.push({
-          role: 'model',
-          parts: streamParts
-        });
-      } else {
-        contents.push({
-          role: 'model',
-          parts: [{ functionCall: toolCall as any }]
-        });
-      }
-
-      contents.push({
-        role: 'user',
-        parts: [{
-          functionResponse: {
-            name: toolCall.name,
-            response: { result: fetchedContent }
-          }
-        }]
-      } as any);
-
-      const secondStream = await ai.models.generateContentStream({
-        model: actualModelName,
-        contents,
-        config
-      });
-
-      for await (const chunk of secondStream) {
-        if (chunk.candidates?.[0]?.groundingMetadata) {
-          groundingMetadata = chunk.candidates[0].groundingMetadata;
-        }
-        if (chunk.text) {
-          accumulatedText += chunk.text;
-          if (onChunk) {
-            onChunk(accumulatedText);
-          }
-        }
-        if (chunk.functionCalls) {
-          functionCalls.push(...chunk.functionCalls);
-        }
-      }
-    }
-
-    return { text: accumulatedText, functionCalls, groundingMetadata };
-  } catch (err: any) {
-    console.warn("Chat streaming failed, using direct response:", err);
-    return sendChatMessage(messages, systemInstruction, modelName, currentImagesBase64, settings);
-  }
+  throw new Error(formatUserFriendlyAiError(lastErr));
 }
 
-export async function executePythonCode(code: string, modelName: string = "gemini-3.6-flash", timeoutMs: number = 45000): Promise<{ text: string, codeExecutionResult?: string, images?: string[] }> {
+export async function executePythonCode(code: string, modelName: string = "gemini-2.5-flash", timeoutMs: number = 45000): Promise<{ text: string, codeExecutionResult?: string, images?: string[] }> {
   const ai = getClient();
-  const actualModelName = resolveActualModelId(modelName);
-  const isGemma = actualModelName.includes('gemma');
+  const baseSequence = getModelSequence(modelName);
+  const candidates = [
+    ...baseSequence.filter(m => getModelCapabilities(m).supportsCodeExecution),
+    ...baseSequence.filter(m => !getModelCapabilities(m).supportsCodeExecution),
+  ];
 
   // To force Gemini to run the user's specific code, we tell it to execute exactly the code provided.
   const prompt = `Please execute the following Python code and return the output.\n\n\`\`\`python\n${code}\n\`\`\`\n\nIf the code generates visualizations or plots, ensure they are returned.`;
 
-  try {
-    const config: any = {
-      temperature: 0,
-    };
-    if (!isGemma) {
-      config.tools = [{ codeExecution: {} }];
-    }
-
-    const generateContentPromise = ai.models.generateContent({
-      model: actualModelName,
-      contents: prompt,
-      config
-    });
-
-    const timeoutPromise = new Promise<any>((_, reject) => {
-      setTimeout(() => reject(new Error("انتهى الوقت المحدد لتشغيل الكود (Timeout). قد يحتوي الكود على حلقة لا نهائية (Infinite Loop) أو يستغرق وقتاً أطول من المسموح به.")), timeoutMs);
-    });
-
-    const response = await Promise.race([generateContentPromise, timeoutPromise]);
-
-
-    let text = "";
+  let lastErr: any = null;
+  for (const candidateModel of candidates) {
+    const caps = getModelCapabilities(candidateModel);
     try {
-      text = response.text || "";
-    } catch(e) {
-      // text getter throws if there's no text part
-    }
-    
-    // Extract execution results from the parts if available
-    let codeExecutionResult = "";
-    const images: string[] = [];
-    const parts = response.candidates?.[0]?.content?.parts || [];
-    
-    for (const part of parts) {
-      if (part.inlineData) {
-        images.push(`data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`);
+      const config: any = {};
+      if (caps.supportsSamplingParams) {
+        config.temperature = 0;
       }
-      
-      if ((part as any).executableCode) {
-        const codeData = (part as any).executableCode.code;
-        codeExecutionResult += `### الشفرة المنفذة:\n\`\`\`python\n${codeData}\n\`\`\`\n\n`;
+      if (caps.supportsCodeExecution) {
+        config.tools = [{ codeExecution: {} }];
       }
-      if ((part as any).codeExecutionResult) {
-        const res = (part as any).codeExecutionResult;
-        codeExecutionResult += `### نتيجة التنفيذ (${res.outcome}):\n\`\`\`text\n${res.output}\n\`\`\`\n\n`;
-      }
-    }
 
-    return { text, codeExecutionResult, images };
-  } catch (error: any) {
-    console.error("Code execution error:", error);
-    let errMsg = typeof error === 'string' ? error : (error.message || JSON.stringify(error));
-    if (errMsg.includes("429") || errMsg.includes("quota") || errMsg.includes("RESOURCE_EXHAUSTED")) {
-      throw new Error("لقد استنفدت الحصة المخصصة (Quota) لمفتاح API الخاص بك (خطأ 429). يرجى الترقية أو استخدام نموذج آخر (مثل 2.5 Flash أو Lite بدلاً من Pro) لتخفيف الضغط على الكوتا.");
+      const timeoutPromise = new Promise<any>((_, reject) => {
+        setTimeout(() => reject(new Error("انتهى الوقت المحدد لتشغيل الكود (Timeout). قد يحتوي الكود على حلقة لا نهائية (Infinite Loop) أو يستغرق وقتاً أطول من المسموح به.")), timeoutMs);
+      });
+
+      let response: any;
+      try {
+        response = await Promise.race([
+          ai.models.generateContent({ model: candidateModel, contents: prompt, config }),
+          timeoutPromise
+        ]);
+      } catch (err: any) {
+        if (config.tools && isUnsupportedCapabilityError(err)) {
+          const fallbackConfig = { ...config };
+          delete fallbackConfig.tools;
+          response = await Promise.race([
+            ai.models.generateContent({ model: candidateModel, contents: prompt, config: fallbackConfig }),
+            timeoutPromise
+          ]);
+        } else {
+          throw err;
+        }
+      }
+
+      let text = "";
+      try {
+        text = response.text || "";
+      } catch(e) {}
+
+      let codeExecutionResult = "";
+      const images: string[] = [];
+      const parts = response.candidates?.[0]?.content?.parts || [];
+
+      for (const part of parts) {
+        if (part.inlineData) {
+          images.push(`data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`);
+        }
+
+        if ((part as any).executableCode) {
+          const codeData = (part as any).executableCode.code;
+          codeExecutionResult += `### الشفرة المنفذة:\n\`\`\`python\n${codeData}\n\`\`\`\n\n`;
+        }
+        if ((part as any).codeExecutionResult) {
+          const res = (part as any).codeExecutionResult;
+          codeExecutionResult += `### نتيجة التنفيذ (${res.outcome}):\n\`\`\`text\n${res.output}\n\`\`\`\n\n`;
+        }
+      }
+
+      return { text, codeExecutionResult, images };
+    } catch (error: any) {
+      lastErr = error;
+      if (isQuotaOrRateLimitError(error)) {
+        markModelRateLimited(candidateModel);
+      }
+      if (isRetryableModelFallbackError(error)) {
+        console.warn(`Code execution model ${candidateModel} unavailable/rate-limited, trying next fallback model...`);
+        continue;
+      }
+      throw error;
     }
-    throw error;
   }
+
+  console.warn("Code execution failed across all fallback models:", formatUserFriendlyAiError(lastErr));
+  throw new Error(formatUserFriendlyAiError(lastErr));
 }
 
 export interface DebugAnalysisResult {
@@ -954,10 +1351,10 @@ export interface DebugAnalysisResult {
 export async function explainAndFixCodeError(
   code: string,
   errorText: string,
-  modelName: string = "gemini-3.6-flash"
+  modelName: string = "gemini-2.5-flash"
 ): Promise<DebugAnalysisResult> {
   const ai = getClient();
-  const actualModel = resolveActualModelId(modelName);
+  const candidates = getModelSequence(modelName);
 
   const prompt = `أنت خبير تصحيح وتنقيح البرامج (Python Debugger) ومساعد ذكي.
 تلقيت كود بايثون يحتوي على خطأ أثناء التنفيذ، مع نص الخطأ التالي.
@@ -989,42 +1386,77 @@ ${errorText}
 }`;
 
   try {
-    const response = await ai.models.generateContent({
-      model: actualModel,
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            errorSummary: { type: Type.STRING },
-            explanation: { type: Type.STRING },
-            suggestions: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING }
+    let lastErr: any = null;
+    for (const candidateModel of candidates) {
+      const caps = getModelCapabilities(candidateModel);
+      try {
+        const config: any = {};
+        if (caps.supportsSamplingParams) {
+          config.temperature = 0.2;
+        }
+        if (caps.supportsStructuredJsonOutput) {
+          config.responseMimeType = "application/json";
+          config.responseSchema = {
+            type: Type.OBJECT,
+            properties: {
+              errorSummary: { type: Type.STRING },
+              explanation: { type: Type.STRING },
+              suggestions: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING }
+              },
+              fixedCode: { type: Type.STRING }
             },
-            fixedCode: { type: Type.STRING }
-          },
-          required: ["errorSummary", "explanation", "suggestions", "fixedCode"]
-        },
-        temperature: 0.2
-      }
-    });
+            required: ["errorSummary", "explanation", "suggestions", "fixedCode"]
+          };
+        }
 
-    const rawText = response.text || "";
-    const parsed = JSON.parse(rawText);
-    return {
-      errorSummary: parsed.errorSummary || "خطأ غير محدد أثناء تشغيل البرنامج",
-      explanation: parsed.explanation || "حدث خطأ غير متوقع أثناء معالجة الكود.",
-      suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions : ["تحقق من المدخلات وأسماء المتغيرات"],
-      fixedCode: parsed.fixedCode || code
-    };
+        let response: any;
+        try {
+          response = await ai.models.generateContent({
+            model: candidateModel,
+            contents: prompt,
+            config
+          });
+        } catch (err: any) {
+          if (config.responseSchema && isUnsupportedCapabilityError(err)) {
+            const plainConfig: any = caps.supportsSamplingParams ? { temperature: 0.2 } : {};
+            response = await ai.models.generateContent({
+              model: candidateModel,
+              contents: prompt,
+              config: plainConfig
+            });
+          } else {
+            throw err;
+          }
+        }
+
+        const rawText = (response.text || "").trim();
+        const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+        const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : rawText);
+        return {
+          errorSummary: parsed.errorSummary || "خطأ غير محدد أثناء تشغيل البرنامج",
+          explanation: parsed.explanation || "حدث خطأ غير متوقع أثناء معالجة الكود.",
+          suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions : ["تحقق من المدخلات وأسماء المتغيرات"],
+          fixedCode: parsed.fixedCode || code
+        };
+      } catch (err: any) {
+        lastErr = err;
+        if (isQuotaOrRateLimitError(err)) {
+          markModelRateLimited(candidateModel);
+        }
+        if (isRetryableModelFallbackError(err)) {
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastErr || new Error("تعذر الاتصال بالنماذج المتاحة.");
   } catch (err) {
-    console.error("Debug analysis error:", err);
-    // Fallback if JSON schema parsing fails
+    console.warn("Debug analysis warning:", formatUserFriendlyAiError(err));
     return {
       errorSummary: "خطأ في تنفيذ السكريبت",
-      explanation: typeof err === 'string' ? err : ((err as any)?.message || "تعذر إكمال التحليل الآلي للخطأ."),
+      explanation: formatUserFriendlyAiError(err),
       suggestions: ["تأكد من صحة بناء الجملة (Syntax)", "تحقق من تعريف كافة المتغيرات والمكتبات المستوردة"],
       fixedCode: code
     };

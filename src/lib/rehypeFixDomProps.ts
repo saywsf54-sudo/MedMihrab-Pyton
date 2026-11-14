@@ -1,3 +1,6 @@
+import rehypeRaw from 'rehype-raw';
+import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
+
 export function parseCssStringToObject(cssString: string): Record<string, string> {
   const styleObj: Record<string, string> = {};
   if (!cssString || typeof cssString !== 'string') return styleObj;
@@ -11,12 +14,13 @@ export function parseCssStringToObject(cssString: string): Record<string, string
     const value = decl.slice(colonIdx + 1).trim();
     if (!property || !value) continue;
 
-    // Strip potentially dangerous CSS values (expression(), javascript:, vbscript:)
+    // Strip potentially dangerous CSS values (expression(), javascript:, vbscript:, url())
     const normalizedVal = value.replace(/[\u0000-\u0020]+/g, '').toLowerCase();
     if (
       normalizedVal.includes('expression(') ||
       normalizedVal.includes('javascript:') ||
-      normalizedVal.includes('vbscript:')
+      normalizedVal.includes('vbscript:') ||
+      normalizedVal.includes('url(')
     ) {
       continue;
     }
@@ -75,6 +79,28 @@ function isSafeUrl(rawUrl: unknown): boolean {
 
 const ALLOWED_COLON_PREFIXES = ['xml:', 'xmlns:', 'xlink:'];
 const DANGEROUS_TAGS = new Set(['script', 'iframe', 'object', 'embed', 'form', 'base', 'meta']);
+
+export const markdownSanitizeSchema = {
+  ...defaultSchema,
+  tagNames: Array.from(new Set([...(defaultSchema.tagNames || []), 'audio', 'source'])),
+  attributes: {
+    ...(defaultSchema.attributes || {}),
+    '*': [
+      ...((defaultSchema.attributes && defaultSchema.attributes['*']) || []),
+      'className',
+      'style',
+      'dir',
+      'lang',
+    ],
+    audio: ['src', 'controls', 'preload', 'loop', 'muted', 'className', 'style'],
+    source: ['src', 'type'],
+  },
+  protocols: {
+    ...(defaultSchema.protocols || {}),
+    src: ['http', 'https', 'data'],
+    href: ['http', 'https', 'mailto', 'tel'],
+  },
+};
 
 export function rehypeFixDomProps() {
   return (tree: any) => {
@@ -148,3 +174,9 @@ export function rehypeFixDomProps() {
     visit(tree);
   };
 }
+
+export const markdownRehypePlugins: any[] = [
+  rehypeRaw,
+  [rehypeSanitize, markdownSanitizeSchema],
+  rehypeFixDomProps,
+];

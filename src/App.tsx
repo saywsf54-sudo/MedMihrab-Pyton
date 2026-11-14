@@ -22,7 +22,8 @@ import {
   AdvancedSettings, 
   DEFAULT_SETTINGS,
   getApiKeyStatus,
-  ApiKeyStatus 
+  ApiKeyStatus,
+  resolveActualModelId
 } from './services/geminiService';
 
 export interface ProjectFile {
@@ -45,8 +46,12 @@ export default function App() {
   const [availableModels, setAvailableModels] = useState<ModelOption[]>(INITIAL_MODELS);
   const [isRefreshingModels, setIsRefreshingModels] = useState<boolean>(false);
   const [selectedModel, setSelectedModel] = useState<string>(() => {
-    const saved = localStorage.getItem('gemini-lab-selected-model');
-    return saved || INITIAL_MODELS[0].id;
+    try {
+      const saved = localStorage.getItem('gemini-lab-selected-model');
+      return resolveActualModelId(saved || INITIAL_MODELS[0].id);
+    } catch {
+      return INITIAL_MODELS[0].id;
+    }
   });
 
   const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState<boolean>(false);
@@ -57,8 +62,11 @@ export default function App() {
   };
 
   const handleModelChange = (newModel: string) => {
-    setSelectedModel(newModel);
-    localStorage.setItem('gemini-lab-selected-model', newModel);
+    const resolved = resolveActualModelId(newModel);
+    setSelectedModel(resolved);
+    try {
+      localStorage.setItem('gemini-lab-selected-model', resolved);
+    } catch {}
   };
 
   const [files, setFiles] = useState<ProjectFile[]>(() => {
@@ -103,7 +111,7 @@ export default function App() {
   const [settings, setSettings] = useState<AdvancedSettings>(() => {
     try {
       const saved = localStorage.getItem('gemini-lab-settings');
-      return saved ? JSON.parse(saved) : DEFAULT_SETTINGS;
+      return saved ? { ...DEFAULT_SETTINGS, ...JSON.parse(saved) } : DEFAULT_SETTINGS;
     } catch {
       return DEFAULT_SETTINGS;
     }
@@ -115,6 +123,17 @@ export default function App() {
     localStorage.setItem('gemini-lab-settings', JSON.stringify(settings));
   }, [settings]);
 
+  const pickPreferredModel = (list: ModelOption[]): string => {
+    return (
+      list.find(m => m.id === 'gemini-3.6-flash')?.id ||
+      list.find(m => m.id === 'gemini-3.8-flash')?.id ||
+      list.find(m => m.id === 'gemini-4-hydrogen')?.id ||
+      list.find(m => m.id === 'gemini-2.5-flash')?.id ||
+      list.find(m => /^gemini-.*flash/i.test(m.id) && !/image|tts|live|audio|omni/i.test(m.id))?.id ||
+      list[0].id
+    );
+  };
+
   // تحديث النماذج تلقائياً عند فتح التطبيق
   useEffect(() => {
     const loadModels = async () => {
@@ -123,9 +142,9 @@ export default function App() {
         const fetched = await fetchAvailableModels();
         if (fetched && fetched.length > 0) {
           setAvailableModels(fetched);
-          const isModelValid = fetched.some(m => m.id === selectedModel) || DEFAULT_ALL_MODELS.some(m => m.id === selectedModel);
+          const isModelValid = fetched.some(m => m.id === selectedModel);
           if (!isModelValid) {
-            handleModelChange(fetched[0].id);
+            handleModelChange(pickPreferredModel(fetched));
           }
         }
       } catch (err) {
@@ -297,24 +316,29 @@ export default function App() {
               <select
                 value={selectedModel}
                 onChange={(e) => handleModelChange(e.target.value)}
-                className="text-[11px] sm:text-[12px] px-2 sm:px-3 py-1 sm:py-1.5 bg-amber-50 dark:bg-slate-800 border border-amber-200 dark:border-slate-700 rounded-xl text-amber-900 dark:text-amber-100 outline-none focus:ring-2 focus:ring-amber-500 font-semibold cursor-pointer max-w-[130px] sm:max-w-[260px] truncate shadow-sm transition-all"
+                className="text-[11px] sm:text-[12px] px-2 sm:px-3 py-1 sm:py-1.5 bg-amber-50 dark:bg-slate-800 border border-amber-200 dark:border-slate-700 rounded-xl text-amber-900 dark:text-amber-100 outline-none focus:ring-2 focus:ring-amber-500 font-mono font-semibold cursor-pointer max-w-[150px] sm:max-w-[280px] truncate shadow-sm transition-all"
                 dir="ltr"
               >
                 {availableModels.map(m => (
-                  <option key={m.id} value={m.id}>{m.name}</option>
+                  <option key={m.id} value={m.id}>{m.id}</option>
                 ))}
               </select>
               <button
                 onClick={async () => {
                   setIsRefreshingModels(true);
                   try {
-                    const fetched = await fetchAvailableModels();
-                    if (fetched && fetched.length > 0) setAvailableModels(fetched);
+                    const fetched = await fetchAvailableModels(true);
+                    if (fetched && fetched.length > 0) {
+                      setAvailableModels(fetched);
+                      if (!fetched.some(m => m.id === selectedModel)) {
+                        handleModelChange(pickPreferredModel(fetched));
+                      }
+                    }
                   } finally {
                     setIsRefreshingModels(false);
                   }
                 }}
-                title="تحديث قائمة النماذج تلقائياً"
+                title="تحديث قائمة النماذج من الخادم"
                 className="p-1.5 sm:p-2 text-amber-600 dark:text-amber-500 hover:text-amber-800 dark:hover:text-amber-300 hover:bg-amber-100 dark:hover:bg-slate-800 rounded-xl transition-colors shrink-0"
               >
                 <RefreshCw size={14} className={`sm:w-[15px] sm:h-[15px] ${isRefreshingModels ? "animate-spin text-amber-600" : ""}`} />
@@ -524,6 +548,7 @@ export default function App() {
                               output={output}
                               images={images}
                               settings={settings}
+                              onUpdateSettings={setSettings}
                               onOpenSmartFetcher={() => setIsSmartFetcherOpen(true)}
                               isFocused={focusedPane === 'chat'}
                               onToggleFocus={() => setFocusedPane(focusedPane === 'chat' ? null : 'chat')}
@@ -606,6 +631,7 @@ export default function App() {
                   output={output}
                   images={images}
                   settings={settings}
+                  onUpdateSettings={setSettings}
                   onOpenSmartFetcher={() => setIsSmartFetcherOpen(true)}
                   isFocused={focusedPane === 'chat'}
                   onToggleFocus={() => setFocusedPane(focusedPane === 'chat' ? null : 'chat')}

@@ -6,7 +6,8 @@ import {
 import { Button } from './ui/button';
 import { 
   AdvancedSettings, AGENT_PRESETS, DEFAULT_SETTINGS, generateSmartPersona,
-  getApiKeyStatus, getCustomApiKey, setCustomApiKey, testApiKeyConnection, ApiKeyStatus 
+  getApiKeyStatus, getCustomApiKey, setCustomApiKey, testApiKeyConnection, ApiKeyStatus,
+  getModelCapabilities
 } from '../services/geminiService';
 import ThemeToggle from './ThemeToggle';
 import { ThemeMode } from '../hooks/useTheme';
@@ -39,13 +40,16 @@ export default function SettingsModal({
   const [testingKey, setTestingKey] = useState<boolean>(false);
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
 
+  const modelCaps = getModelCapabilities(selectedModel);
+
   useEffect(() => {
     if (isOpen) {
+      setLocalSettings(settings);
       setApiKeyInput(getCustomApiKey());
       setApiKeyStatus(getApiKeyStatus());
       setTestResult(null);
     }
-  }, [isOpen]);
+  }, [isOpen, settings]);
 
   if (!isOpen) return null;
 
@@ -259,15 +263,23 @@ export default function SettingsModal({
           {/* TAB 2: PARAMETERS & TUNING */}
           {activeTab === 'parameters' && (
             <div className="space-y-6">
+              {!modelCaps.supportsSamplingParams && (
+                <div className="p-3.5 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 text-xs text-amber-800 dark:text-amber-200 flex items-start gap-2.5">
+                  <AlertCircle size={16} className="shrink-0 mt-0.5 text-amber-600 dark:text-amber-400" />
+                  <p className="leading-relaxed">
+                    النموذج النشط (<code className="font-mono font-bold" dir="ltr">{modelCaps.modelId}</code>) يدير معايير <span className="font-mono" dir="ltr">temperature / topP / topK</span> تلقائياً؛ لذا تُستبعد هذه القيم تلقائياً عند الإرسال لهذا النموذج وتُحفظ تفضيلاتك لاستخدامها مع النماذج الأخرى.
+                  </p>
+                </div>
+              )}
               
               {/* Temperature */}
-              <div className="bg-slate-50 dark:bg-slate-800/60 p-4 rounded-xl border border-slate-200/80 dark:border-slate-700/80 space-y-2">
+              <div className={`bg-slate-50 dark:bg-slate-800/60 p-4 rounded-xl border border-slate-200/80 dark:border-slate-700/80 space-y-2 ${!modelCaps.supportsSamplingParams ? 'opacity-60' : ''}`}>
                 <div className="flex justify-between items-center">
                   <label className="font-bold text-xs text-slate-800 dark:text-slate-200">
                     درجة الحرارة والإبداع (Temperature):
                   </label>
                   <span className="text-xs font-mono font-bold bg-blue-100 dark:bg-blue-950 text-blue-700 dark:text-blue-300 px-2 py-0.5 rounded-md border border-blue-200 dark:border-blue-800">
-                    {localSettings.temperature}
+                    {modelCaps.supportsSamplingParams ? localSettings.temperature : 'تلقائي'}
                   </span>
                 </div>
                 <input
@@ -275,9 +287,10 @@ export default function SettingsModal({
                   min="0.0"
                   max="1.0"
                   step="0.05"
+                  disabled={!modelCaps.supportsSamplingParams}
                   value={localSettings.temperature}
                   onChange={(e) => setLocalSettings(prev => ({ ...prev, temperature: parseFloat(e.target.value) }))}
-                  className="w-full accent-blue-600 cursor-pointer"
+                  className="w-full accent-blue-600 cursor-pointer disabled:cursor-not-allowed"
                 />
                 <div className="flex justify-between text-[10px] text-slate-400 dark:text-slate-500">
                   <span>0.0 (دقيق ومنطقي جداً)</span>
@@ -287,12 +300,12 @@ export default function SettingsModal({
               </div>
 
               {/* Top-P & Top-K */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div className={`grid grid-cols-1 sm:grid-cols-2 gap-4 ${!modelCaps.supportsSamplingParams ? 'opacity-60' : ''}`}>
                 <div className="bg-slate-50 dark:bg-slate-800/60 p-4 rounded-xl border border-slate-200/80 dark:border-slate-700/80 space-y-2">
                   <div className="flex justify-between items-center">
                     <label className="font-bold text-xs text-slate-800 dark:text-slate-200">Top-P (Nucleus Sampling):</label>
                     <span className="text-xs font-mono font-bold bg-slate-200 dark:bg-slate-700 text-slate-800 dark:text-slate-200 px-2 py-0.5 rounded-md">
-                      {localSettings.topP}
+                      {modelCaps.supportsSamplingParams ? localSettings.topP : 'تلقائي'}
                     </span>
                   </div>
                   <input
@@ -300,9 +313,10 @@ export default function SettingsModal({
                     min="0.1"
                     max="1.0"
                     step="0.05"
+                    disabled={!modelCaps.supportsSamplingParams}
                     value={localSettings.topP}
                     onChange={(e) => setLocalSettings(prev => ({ ...prev, topP: parseFloat(e.target.value) }))}
-                    className="w-full accent-blue-600 cursor-pointer"
+                    className="w-full accent-blue-600 cursor-pointer disabled:cursor-not-allowed"
                   />
                 </div>
 
@@ -310,7 +324,7 @@ export default function SettingsModal({
                   <div className="flex justify-between items-center">
                     <label className="font-bold text-xs text-slate-800 dark:text-slate-200">Top-K (Candidate Pool):</label>
                     <span className="text-xs font-mono font-bold bg-slate-200 dark:bg-slate-700 text-slate-800 dark:text-slate-200 px-2 py-0.5 rounded-md">
-                      {localSettings.topK}
+                      {modelCaps.supportsSamplingParams ? localSettings.topK : 'تلقائي'}
                     </span>
                   </div>
                   <input
@@ -318,9 +332,10 @@ export default function SettingsModal({
                     min="1"
                     max="100"
                     step="1"
+                    disabled={!modelCaps.supportsSamplingParams}
                     value={localSettings.topK}
                     onChange={(e) => setLocalSettings(prev => ({ ...prev, topK: parseInt(e.target.value) }))}
-                    className="w-full accent-blue-600 cursor-pointer"
+                    className="w-full accent-blue-600 cursor-pointer disabled:cursor-not-allowed"
                   />
                 </div>
               </div>
@@ -349,34 +364,113 @@ export default function SettingsModal({
           {/* TAB 3: TOOLS & ENVIRONMENT */}
           {activeTab === 'tools' && (
             <div className="space-y-5">
+
+              {/* Active Model Capabilities Banner */}
+              <div className="p-4 rounded-xl border border-blue-200 dark:border-blue-900/60 bg-blue-50/70 dark:bg-blue-950/30 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs font-bold text-slate-900 dark:text-slate-100 flex items-center gap-1.5">
+                    <Cpu size={14} className="text-blue-600 dark:text-blue-400" />
+                    توافق الأدوات التلقائي للنموذج:
+                  </span>
+                  <code className="text-[11px] font-mono font-bold px-2 py-0.5 rounded bg-white dark:bg-slate-900 border border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300" dir="ltr">
+                    {modelCaps.modelId}
+                  </code>
+                </div>
+                <p className="text-[11px] text-slate-600 dark:text-slate-300 leading-relaxed">
+                  {modelCaps.summaryAr}
+                </p>
+                <div className="flex flex-wrap gap-1.5 pt-0.5 text-[10px] font-bold">
+                  <span className={`px-2 py-0.5 rounded border ${
+                    modelCaps.supportsGoogleSearch
+                      ? 'bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
+                      : 'bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 border-slate-200 dark:border-slate-700'
+                  }`}>
+                    بحث Google: {modelCaps.supportsGoogleSearch ? 'مدعوم' : 'غير مدعوم'}
+                  </span>
+                  <span className={`px-2 py-0.5 rounded border ${
+                    modelCaps.supportsFunctionCalling
+                      ? 'bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
+                      : 'bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 border-slate-200 dark:border-slate-700'
+                  }`}>
+                    أدوات المحرر والوظائف: {modelCaps.supportsFunctionCalling ? 'مدعوم' : 'غير مدعوم'}
+                  </span>
+                  <span className={`px-2 py-0.5 rounded border ${
+                    modelCaps.supportsHybridTools && modelCaps.supportsIncludeServerSideToolInvocations
+                      ? 'bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
+                      : 'bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800'
+                  }`}>
+                    دمج الأدوات + includeServerSideToolInvocations: {modelCaps.supportsHybridTools && modelCaps.supportsIncludeServerSideToolInvocations ? 'مدعوم' : 'مفصول تلقائياً'}
+                  </span>
+                </div>
+              </div>
               
-              {/* Toggle Google Search */}
-              <div className="flex items-center justify-between p-4 bg-slate-50 dark:bg-slate-800/60 rounded-xl border border-slate-200/80 dark:border-slate-700/80">
-                <div>
-                  <h4 className="font-bold text-xs text-slate-900 dark:text-slate-100">البحث الحاد المباشر عبر Google Search:</h4>
-                  <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">يتيح للنموذج الوصول لأحدث المعلومات والبيانات من الويب تلقائياً.</p>
+              {/* Toggle Tool Bridge for non-native models */}
+              <div className="flex items-center justify-between p-4 bg-emerald-50/70 dark:bg-emerald-950/30 rounded-xl border border-emerald-200/80 dark:border-emerald-800/70">
+                <div className="pl-3">
+                  <h4 className="font-bold text-xs text-emerald-900 dark:text-emerald-200">تفعيل جسر البحث والأدوات للنماذج القياسية (Tool Bridge):</h4>
+                  <p className="text-[11px] text-emerald-800/80 dark:text-emerald-300/80 mt-0.5">
+                    يمكّن النماذج التي لا تدعم البحث أو الأدوات أصلياً (مثل Gemma أو النماذج المتخصصة أو غير الهجينة) من البحث في الويب وجلب القرآن والحديث وتعديل المحرر عبر خادم المنصة.
+                  </p>
                 </div>
                 <input
                   type="checkbox"
-                  checked={localSettings.enableGoogleSearch}
+                  checked={localSettings.enableToolBridge !== false}
+                  onChange={(e) => setLocalSettings(prev => ({ ...prev, enableToolBridge: e.target.checked }))}
+                  className="w-5 h-5 accent-emerald-600 cursor-pointer rounded shrink-0"
+                />
+              </div>
+
+              {/* Toggle Google Search */}
+              <div className={`flex items-center justify-between p-4 bg-slate-50 dark:bg-slate-800/60 rounded-xl border border-slate-200/80 dark:border-slate-700/80 ${!modelCaps.supportsGoogleSearch && localSettings.enableToolBridge === false ? 'opacity-65' : ''}`}>
+                <div className="pl-3">
+                  <h4 className="font-bold text-xs text-slate-900 dark:text-slate-100">البحث الحاد المباشر عبر الويب (Web / Google Search):</h4>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                    {modelCaps.supportsGoogleSearch
+                      ? 'يتيح للنموذج الوصول لأحدث المعلومات والبيانات من الويب تلقائياً.'
+                      : localSettings.enableToolBridge !== false
+                      ? 'هذا النموذج لا يدعم Google Search أصلياً، وسيعمل عبر جسر البحث بالويب المدمج تلقائياً.'
+                      : 'معطل لأن النموذج لا يدعم Google Search وجسر البحث مغلق.'}
+                  </p>
+                </div>
+                <input
+                  type="checkbox"
+                  disabled={!modelCaps.supportsGoogleSearch && localSettings.enableToolBridge === false}
+                  checked={(modelCaps.supportsGoogleSearch || localSettings.enableToolBridge !== false) ? localSettings.enableGoogleSearch : false}
                   onChange={(e) => setLocalSettings(prev => ({ ...prev, enableGoogleSearch: e.target.checked }))}
-                  className="w-5 h-5 accent-blue-600 cursor-pointer rounded"
+                  className="w-5 h-5 accent-blue-600 cursor-pointer disabled:cursor-not-allowed rounded shrink-0"
                 />
               </div>
 
               {/* Toggle Editor Tools */}
-              <div className="flex items-center justify-between p-4 bg-slate-50 dark:bg-slate-800/60 rounded-xl border border-slate-200/80 dark:border-slate-700/80">
-                <div>
-                  <h4 className="font-bold text-xs text-slate-900 dark:text-slate-100">تفعيل أدوات التحكم بالمحرر (Code Editor Tools):</h4>
-                  <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">السماح للنموذج بتحديث كود المحرر بـ update_editor_code وتشغيل البرامج تلقائياً.</p>
+              <div className={`flex items-center justify-between p-4 bg-slate-50 dark:bg-slate-800/60 rounded-xl border border-slate-200/80 dark:border-slate-700/80 ${!modelCaps.supportsFunctionCalling && localSettings.enableToolBridge === false ? 'opacity-65' : ''}`}>
+                <div className="pl-3">
+                  <h4 className="font-bold text-xs text-slate-900 dark:text-slate-100">تفعيل أدوات التحكم بالمحرر والقرآن والحديث (Tools):</h4>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                    {modelCaps.supportsFunctionCalling
+                      ? 'السماح للنموذج بتحديث كود المحرر بـ update_editor_code وجلب النصوص الشرعية وتشغيل البرامج تلقائياً.'
+                      : localSettings.enableToolBridge !== false
+                      ? 'هذا النموذج لا يدعم Function Calling أصلياً، وستعمل الأدوات عبر الجسر الذكي تلقائياً.'
+                      : 'معطل لأن النموذج لا يدعم Function Calling وجسر الأدوات مغلق.'}
+                  </p>
                 </div>
                 <input
                   type="checkbox"
-                  checked={localSettings.enableEditorTools}
+                  disabled={!modelCaps.supportsFunctionCalling && localSettings.enableToolBridge === false}
+                  checked={(modelCaps.supportsFunctionCalling || localSettings.enableToolBridge !== false) ? localSettings.enableEditorTools : false}
                   onChange={(e) => setLocalSettings(prev => ({ ...prev, enableEditorTools: e.target.checked }))}
-                  className="w-5 h-5 accent-blue-600 cursor-pointer rounded"
+                  className="w-5 h-5 accent-blue-600 cursor-pointer disabled:cursor-not-allowed rounded shrink-0"
                 />
               </div>
+
+              {modelCaps.supportsFunctionCalling &&
+                modelCaps.supportsGoogleSearch &&
+                !modelCaps.supportsHybridTools &&
+                localSettings.enableEditorTools &&
+                localSettings.enableGoogleSearch && (
+                  <div className="p-3 rounded-xl bg-amber-50 dark:bg-amber-950/35 border border-amber-200 dark:border-amber-800/60 text-[11px] text-amber-800 dark:text-amber-200 leading-relaxed">
+                    ملاحظة التبديل التلقائي: لأن النموذج النشط لا يدعم دمج الأدوات المخصصة مع بحث Google في نفس الطلب، سيفعّل النظام الأداة الأنسب أصلياً ويشغّل الأخرى عبر الجسر الذكي دون إرسال <span className="font-mono" dir="ltr">includeServerSideToolInvocations</span>.
+                  </div>
+                )}
 
               {/* Timeout for Python Execution */}
               <div className="bg-slate-50 dark:bg-slate-800/60 p-4 rounded-xl border border-slate-200/80 dark:border-slate-700/80 space-y-2">

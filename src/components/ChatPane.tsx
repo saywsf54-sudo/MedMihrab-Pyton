@@ -1,15 +1,16 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { User, Sparkles, Copy, Check, Plus, History, Trash2, Zap, Clock, MessageSquarePlus, ChevronDown, Globe, Search, ExternalLink, FileCode, Play, Download, RotateCcw, Volume2, VolumeX, Edit3, Music } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
-import rehypeRaw from 'rehype-raw';
-import { rehypeFixDomProps } from '../lib/rehypeFixDomProps';
+import { markdownRehypePlugins } from '../lib/rehypeFixDomProps';
+import { PreBlock, CodeBlock } from './MarkdownCodeBlocks';
 import {
   sendChatMessage,
   sendChatMessageStream,
   AdvancedSettings,
   DEFAULT_SETTINGS,
   hasCodeOrEditorIntent,
-  isPureGreetingOrSocial
+  isPureGreetingOrSocial,
+  getModelCapabilities
 } from '../services/geminiService';
 import QuranAudioPlayer from './QuranAudioPlayer';
 import ChatInputForm from './ChatInputForm';
@@ -81,6 +82,7 @@ interface ChatPaneProps {
   onUpdateCode: (code: string) => void;
   onRunCode?: (code?: string) => Promise<void>;
   settings?: AdvancedSettings;
+  onUpdateSettings?: (newSettings: AdvancedSettings) => void;
   onOpenSmartFetcher?: () => void;
   isFocused?: boolean;
   onToggleFocus?: () => void;
@@ -93,70 +95,7 @@ const DEFAULT_WELCOME_MESSAGE: Message = {
   content: 'مرحباً بك! أنا "مداد الرحمن" والوكيل المخصص لبرمجة Python والعلوم الرقمية الإسلامية وتحليل البيانات.\n\nكيف يمكنني مساعدتك اليوم؟ يمكنك إخباري لتعديل الكود في المحرر فوراً، أو تجربة وتنفيد حزم بايثون، استخراج إحصاءات، ورسم المخططات البيانية.'
 };
 
-function extractTextFromChildren(node: React.ReactNode): string {
-  if (typeof node === 'string' || typeof node === 'number') return String(node);
-  if (Array.isArray(node)) return node.map(extractTextFromChildren).join('');
-  if (React.isValidElement(node) && (node.props as any)?.children !== undefined) {
-    return extractTextFromChildren((node.props as any).children);
-  }
-  return '';
-}
-
-const PreBlock = ({ children }: any) => {
-  const [copied, setCopied] = useState(false);
-  const codeString = extractTextFromChildren(children).replace(/\n$/, '');
-
-  const handleCopy = async () => {
-    const ok = await copyToClipboard(codeString);
-    if (ok) {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    }
-  };
-
-  return (
-    <div className="relative group my-4" dir="ltr">
-      <div className="absolute top-2 right-2 z-10 flex">
-        <button
-          type="button"
-          onClick={handleCopy}
-          className="p-1.5 bg-[#1e293b]/80 backdrop-blur-sm text-slate-300 hover:text-white hover:bg-emerald-500 rounded-md transition-all shadow-sm border border-slate-600/50"
-          title="نسخ الكود"
-        >
-          {copied ? <Check size={14} className="text-white" /> : <Copy size={14} />}
-        </button>
-      </div>
-      <pre
-        data-code-block="true"
-        className="!bg-[#0f172a] !text-slate-50 !p-4 !m-0 rounded-xl overflow-x-auto text-[13px] font-mono shadow-sm border border-slate-700"
-      >
-        {children}
-      </pre>
-    </div>
-  );
-};
-
-const CodeBlock = ({ inline, className, children, ...props }: any) => {
-  const match = /language-(\w+)/.exec(className || '');
-  const codeString = String(children);
-  const isBlock = inline === false || Boolean(match) || codeString.includes('\n');
-
-  if (isBlock) {
-    return (
-      <code className={className} {...props}>
-        {children}
-      </code>
-    );
-  }
-  return (
-    <code
-      className={`bg-slate-100 dark:bg-slate-800 text-pink-600 dark:text-pink-400 px-1.5 py-0.5 rounded text-[12px] font-mono [[data-code-block]>&]:bg-transparent [[data-code-block]>&]:text-inherit [[data-code-block]>&]:p-0 [[data-code-block]>&]:rounded-none [[data-code-block]>&]:text-[13px] ${className || ''}`}
-      {...props}
-    >
-      {children}
-    </code>
-  );
-};
+const ChatCodeBlock = (props: any) => <CodeBlock {...props} inlineTone="pink" />;
 
 export default function ChatPane({
   currentCode,
@@ -166,6 +105,7 @@ export default function ChatPane({
   onUpdateCode,
   onRunCode,
   settings = DEFAULT_SETTINGS,
+  onUpdateSettings,
   onOpenSmartFetcher,
   isFocused = false,
   onToggleFocus
@@ -220,26 +160,48 @@ export default function ChatPane({
     return null;
   };
 
-  // Text-To-Speech SpeechSynthesis
-  const handleToggleSpeech = (msgId: string, text: string) => {
-    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
-      console.warn('SpeechSynthesis API is not supported in this browser.');
-      return;
-    }
+  // Gemini AI Audio TTS Reader (gemini-3.8-flash-lite-tts / gemini-4-hydrogen)
+  const handleToggleSpeech = async (msgId: string, text: string) => {
     if (speakingMsgId === msgId) {
-      window.speechSynthesis.cancel();
+      if ((window as any).__midadAudioPlayer) {
+        (window as any).__midadAudioPlayer.pause();
+        (window as any).__midadAudioPlayer = null;
+      }
       setSpeakingMsgId(null);
       return;
     }
-    window.speechSynthesis.cancel();
-    const cleanText = text.replace(/```[\s\S]*?```/g, ' كود برمجي ').replace(/[#*`_]/g, '');
-    const utterance = new SpeechSynthesisUtterance(cleanText);
-    utterance.lang = 'ar-SA';
-    utterance.rate = 1.0;
-    utterance.onend = () => setSpeakingMsgId(null);
-    utterance.onerror = () => setSpeakingMsgId(null);
+
+    if ((window as any).__midadAudioPlayer) {
+      (window as any).__midadAudioPlayer.pause();
+      (window as any).__midadAudioPlayer = null;
+    }
+
     setSpeakingMsgId(msgId);
-    window.speechSynthesis.speak(utterance);
+    try {
+      const customKey = localStorage.getItem('gemini_user_api_key') || localStorage.getItem('gemini-custom-api-key') || '';
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (customKey) headers['x-custom-api-key'] = customKey;
+
+      const res = await fetch('/api/gemini/tts', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ text, voice: 'Kore' })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.audioBase64) {
+        throw new Error(data.error || 'فشل توليد التلاوة عبر نموذج جيميني الصوتي.');
+      }
+
+      const audio = new Audio(`data:audio/wav;base64,${data.audioBase64}`);
+      (window as any).__midadAudioPlayer = audio;
+      audio.onended = () => setSpeakingMsgId(null);
+      audio.onerror = () => setSpeakingMsgId(null);
+      await audio.play();
+    } catch (err) {
+      console.warn("Gemini audio playback warning:", err);
+      setSpeakingMsgId(null);
+      alert('تعذر تشغيل الصوت عبر نموذج جيميني: ' + (err instanceof Error ? err.message : String(err)));
+    }
   };
 
   // Apply Code to Editor
@@ -614,12 +576,60 @@ ${cappedOutput}
               <span>{isFocused ? 'خروج' : 'التركيز العميق'}</span>
             </button>
           )}
+
+          {/* One-Click Search & Tools Toggle Button (enables Bridge on non-native models like Gemma) */}
+          {(() => {
+            const caps = getModelCapabilities(selectedModel);
+            const isSearchAndToolsOn = Boolean(settings.enableGoogleSearch && settings.enableEditorTools);
+            const isBridgeActive = isSearchAndToolsOn && (settings.enableToolBridge !== false) && (!caps.supportsGoogleSearch || !caps.supportsFunctionCalling || !caps.supportsHybridTools);
+
+            const handleToggleSearchAndTools = () => {
+              if (!onUpdateSettings) return;
+              const nextState = !isSearchAndToolsOn;
+              onUpdateSettings({
+                ...settings,
+                enableGoogleSearch: nextState,
+                enableEditorTools: nextState,
+                enableToolBridge: nextState
+              });
+            };
+
+            return (
+              <button
+                type="button"
+                onClick={handleToggleSearchAndTools}
+                disabled={!onUpdateSettings}
+                className={`flex items-center gap-1 px-2 py-0.5 sm:py-1 rounded-md text-[10px] sm:text-[11px] font-bold transition-all shadow-2xs border whitespace-nowrap ${
+                  isSearchAndToolsOn
+                    ? isBridgeActive
+                      ? 'bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-700'
+                      : 'bg-blue-600 hover:bg-blue-700 text-white border-blue-700'
+                    : 'bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 border-slate-300 dark:border-slate-700'
+                }`}
+                title={
+                  isSearchAndToolsOn
+                    ? isBridgeActive
+                      ? 'البحث والأدوات مفعّلان عبر الجسر الذكي لتمكين هذا النموذج من البحث واستخدام الأدوات'
+                      : 'البحث المباشر وأدوات المحرر مفعّلان — انقر لتعطيلهما'
+                    : 'البحث والأدوات معطّلان — انقر لتفعيلهما لجميع النماذج (بما في ذلك النماذج غير الداعمة)'
+                }
+              >
+                <Globe size={11} className={isSearchAndToolsOn ? "text-white" : "text-slate-400"} />
+                <span>
+                  {isSearchAndToolsOn
+                    ? (isBridgeActive ? 'البحث والأدوات (جسر نشط)' : 'البحث والأدوات: مفعّل')
+                    : 'تفعيل البحث والأدوات'}
+                </span>
+              </button>
+            );
+          })()}
         </div>
 
-        {/* Right: Selected Model Pill & Streaming Indicator */}
+        {/* Right: Selected Model Badge & Streaming Indicator */}
         <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
           <span 
             className="text-[10px] text-amber-800 dark:text-amber-300 font-mono font-semibold bg-amber-50 dark:bg-amber-950/60 px-1.5 sm:px-2 py-0.5 rounded-full border border-amber-200 dark:border-amber-800/60 max-w-[110px] sm:max-w-[180px] truncate"
+            dir="ltr"
             title="النموذج المعتمد حالياً لهذه المحادثة"
           >
             {selectedModel}
@@ -710,9 +720,9 @@ ${cappedOutput}
                         </div>
                       ) : (
                         <ReactMarkdown
-                          rehypePlugins={[rehypeRaw, rehypeFixDomProps]}
+                          rehypePlugins={markdownRehypePlugins}
                           components={{
-                            code: CodeBlock,
+                            code: ChatCodeBlock,
                             pre: PreBlock,
                             audio: ({ node, src, ...props }) => {
                               return (
