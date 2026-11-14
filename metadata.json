@@ -1,0 +1,8 @@
+{
+  "name": "مكتبة مداد الرحمن - محراب القرآن الكريم ",
+  "description": "منصة متطورة للقرآن الكريم والسنة النبوية متصلة بالذكاء الاصطناعي",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "id": "/",
+  "name": "محراب القرآن - مداد الرحمن",
+  "short_name": "محراب القرآن",
+  "description": "منصة إسلامية متكاملة للقرآن الكريم، التلاوات، والعلوم الرقمية والتحليل البرمجي الذكي.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "dir": "rtl",
+  "lang": "ar",
+  "theme_color": "#78350f",
+  "background_color": "#0f172a",
+  "icons": [
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icon.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ],
+  "categories": [
+    "education",
+    "books",
+    "productivity",
+    "utilities"
+  ],
+  "screenshots": [
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "form_factor": "wide",
+      "label": "محراب القرآن - منصة مداد الرحمن الذكية"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "form_factor": "narrow",
+      "label": "واجهة الهاتف الذكي - محراب القرآن"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "المداد الذكي",
+      "short_name": "الذكاء",
+      "description": "استشارة المساعد الذكي في العلوم الإسلامية والبرمجية",
+      "url": "/?tab=chat",
+      "icons": [{ "src": "/pwa-192x192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "محرر بايثون",
+      "short_name": "المحرر",
+      "description": "تشغيل وتحليل كود بايثون وحساب الجمل",
+      "url": "/?tab=editor",
+      "icons": [{ "src": "/pwa-192x192.png", "sizes": "192x192" }]
+    }
+  ]
+}

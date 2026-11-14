@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Accessible Viewport (WCAG compliant zoom) -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <!-- Security Headers & Referrer Control -->
+    <meta http-equiv="X-Content-Type-Options" content="nosniff" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; font-src 'self' https://fonts.gstatic.com https://cdn.jsdelivr.net data:; img-src 'self' data: https: blob:; media-src 'self' https: blob:; connect-src 'self' https: ws: wss:;"
+    />
+    
+    <!-- PWA & Mobile Web Standards -->
+    <meta name="theme-color" content="#78350f" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0f172a" media="(prefers-color-scheme: dark)" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="محراب القرآن" />
+    <meta name="application-name" content="محراب القرآن" />
+    <meta name="description" content="منصة قرآنية متكاملة تتيح الاستماع للقراء والروايات المتعددة، وتوفر واجهة إسلامية حديثة وتجربة مستخدم روحانية." />
+
+    <!-- Open Graph & Social Cards -->
+    <meta property="og:title" content="محراب القرآن | منصة مداد الرحمن الذكية" />
+    <meta property="og:description" content="منصة قرآنية متكاملة تتيح الاستماع للقراء والروايات المتعددة، وتوفر واجهة إسلامية حديثة وتجربة مستخدم روحانية." />
+    <meta property="og:image" content="/pwa-512x512.png" />
+    <meta property="og:type" content="website" />
+
+    <!-- PWA Manifest & App Icons -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/pwa-192x192.png" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/pwa-512x512.png" />
+    <link rel="shortcut icon" href="/favicon.ico" />
+
+    <!-- Preconnect & Font Loading -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Amiri:ital,wght@0,400;0,700;1,400;1,700&family=Tajawal:wght@300;400;500;700;800;900&family=Scheherazade+New:wght@400;500;600;700&family=Lateef:wght@400;500;600;700&family=Aref+Ruqaa:wght@400;700&family=Noto+Nastaliq+Urdu:wght@400;500;600;700&family=Reem+Kufi:wght@400;500;600;700&family=Lalezar&family=Qahiri&display=swap" rel="stylesheet" />
+
+    <!-- Encapsulated Early PWA Prompt Capture -->
+    <script>
+      (function () {
+        'use strict';
+        window.__pwaPrompt = null;
+        window.addEventListener('beforeinstallprompt', function (event) {
+          event.preventDefault();
+          window.__pwaPrompt = event;
+          window.dispatchEvent(new CustomEvent('pwa-prompt-available', { detail: { event: event } }));
+        });
+      })();
+    </script>
+
+    <title>محراب القرآن | منصة مداد الرحمن الذكية</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
