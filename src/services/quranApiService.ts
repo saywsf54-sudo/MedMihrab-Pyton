@@ -391,7 +391,13 @@ export function findSurahByNameOrNumber(query: string | number): number {
  */
 export function stripTajweedTags(text: string): string {
   if (!text) return '';
-  return text.replace(/\[[a-zA-Z0-9_:|~#\-\.\s\d]*\]?/g, '').replace(/[\[\]]/g, '').replace(/\s+/g, ' ').trim();
+  return text
+    .replace(/\[[a-zA-Z0-9_:|~#\-\.\s\d]*\]?/g, '')
+    .replace(/[\[\]]/g, '')
+    .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '')
+    .replace(/[\s\u200A]+(?=\u0670)/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 const apiCache = new Map<string, any>();
@@ -617,20 +623,38 @@ print(f"اسم السورة: {surah_data.get('name')} ({surah_data.get('englishN
 print(f"عدد الآيات: {surah_data.get('numberOfAyahs')} | نوع النزول: {surah_data.get('revelationType')}")
 print("-" * 50)
 
-# عرض الآيات مع تنظيف الرموز
-all_text = ""
+def clean_arabic_letters(text):
+    """إزالة التشكيل والرموز العثمانية والضبط مع الحفاظ على حروف الرسم وتوحيد الياء الفارسية"""
+    if not text: return ""
+    text = re.sub(r'[\s\u200a]+(?=\u0670)', '', text)
+    text = re.sub(r'[\u200a\u200b-\u200d\u2060\ufeff]', '', text)
+    text = re.sub(r'[\u0610-\u061A\u0640\u064B-\u065F\u0670\u06D6-\u06ED\u08D3-\u08FF]', '', text)
+    text = text.replace('ی', 'ي')
+    return re.sub(r'\s+', ' ', text).strip()
+
+# عرض الآيات مع تنظيف الرموز وفصل البسملة المدمجة في الآية الأولى (لغير الفاتحة والتوبة)
+BASMALAH_PREFIX = "بِسۡمِ ٱللَّهِ ٱلرَّحۡمَـٰنِ ٱلرَّحِیمِ"
+all_clean_text = ""
+total_words = 0
+surah_num_val = surah_data.get('number', ${sNum})
 for idx, ayah in enumerate(surah_data.get('ayahs', []), 1):
-    raw_text = ayah.get('text', '')
+    raw_text = re.sub(r'[\s\u200a]+(?=\u0670)', '', ayah.get('text', ''))
     text = clean_tajweed(raw_text)
-    all_text += " " + text
+    if idx == 1 and surah_num_val not in (1, 9):
+        if text.startswith(BASMALAH_PREFIX):
+            text = text[len(BASMALAH_PREFIX):].strip()
+        elif text.startswith("بسم الله الرحمن الرحيم "):
+            text = text[len("بسم الله الرحمن الرحيم "):].strip()
+    cleaned = clean_arabic_letters(text)
+    total_words += len(cleaned.split())
+    all_clean_text += " " + cleaned
     print(f"[{ayah.get('numberInSurah')}] {text}")
 
-# إحصائيات سريعة للألفاظ والجُمل
-words = all_text.split()
-chars = len(all_text.replace(' ', ''))
+# إحصائيات دقيقة للألفاظ والحروف بعد إزالة التشكيل
+chars = len(all_clean_text.replace(' ', ''))
 print("=" * 50)
-print(f"إجمالي الكلمات في السورة: {len(words)}")
-print(f"إجمالي عدد الحروف (بدون مسافات): {chars}")
+print(f"إجمالي الكلمات في السورة (بدون البسملة الملحقة): {total_words}")
+print(f"إجمالي عدد الحروف المجردة (بدون مسافات وتشكيل): {chars}")
 `;
   }
 

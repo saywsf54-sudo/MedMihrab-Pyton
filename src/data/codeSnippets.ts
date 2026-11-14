@@ -28,10 +28,12 @@ quran_text = """
 صِرَاطَ الَّذِينَ أَنْعَمْتَ عَلَيْهِمْ غَيْرِ الْمَغْضُوبِ عَلَيْهِمْ وَلَا الضَّالِّينَ
 """
 
-# إزالة التشكيل البسيط للتحليل الإحصائي
+# إزالة التشكيل وعلامات الضبط والوقف للتحليل الإحصائي الدقيق
 def remove_tashkeel(text):
-    tashkeel_pattern = re.compile(r'[\u0617-\u061A\u064B-\u0652]')
-    return re.sub(tashkeel_pattern, '', text)
+    text = re.sub(r'[\s\u200a]+(?=\u0670)', '', text)
+    tashkeel_pattern = re.compile(r'[\u0610-\u061A\u0640\u064B-\u065F\u0670\u06D6-\u06ED\u08D3-\u08FF\u200a\u200b-\u200d\u2060\ufeff]')
+    text = re.sub(tashkeel_pattern, '', text)
+    return text.replace('ی', 'ي')
 
 clean_text = remove_tashkeel(quran_text)
 words = [w.strip() for w in clean_text.split() if w.strip()]
